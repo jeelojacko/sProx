@@ -15,6 +15,7 @@ http-proxy = [
     "dep:axum",
     "dep:tower",
     "dep:hyper",
+    "dep:reqwest",
 ]
 
 # Enable configuration serialization/deserialization helpers.
@@ -38,13 +39,13 @@ streaming-dash = []
 
 [dependencies]
 anyhow = "1.0"
-axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "macros"], optional = true }
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "macros", "tokio"], optional = true }
 bytes = { version = "1.5", optional = true }
 config = { version = "0.13", default-features = false, features = ["yaml", "toml"], optional = true }
 futures = "0.3"
 globset = "0.4"
 hyper = { version = "0.14", features = ["full"], optional = true }
-reqwest = { version = "=0.11.26", default-features = false, features = ["json", "stream"], optional = true }
+reqwest = { version = "=0.11.26", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 aes-gcm = { version = "0.10", features = ["aes"], optional = false }
 base64 = "0.21"
 hmac = "0.12"
