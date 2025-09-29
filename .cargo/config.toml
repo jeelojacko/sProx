@@ -1,6 +1,3 @@
 [alias]
 fmt-check = "fmt --all -- --check"
 clippy-all = "clippy --all-targets --all-features -- -D warnings"
-
-[target.'cfg(unix)']
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]

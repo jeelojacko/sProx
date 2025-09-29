@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use std::io::ErrorKind;
 use tracing_subscriber::EnvFilter;
 
@@ -6,7 +6,7 @@ fn main() -> anyhow::Result<()> {
     load_env_file()?;
     init_tracing()?;
 
-    sprox::init_placeholder();
+    sProx::init_placeholder();
 
     tracing::info!("sProx bootstrap complete");
 
@@ -31,5 +31,7 @@ fn init_tracing() -> anyhow::Result<()> {
         .with_target(false)
         .compact()
         .try_init()
-        .context("failed to initialize tracing subscriber")
+        .map_err(|err| anyhow!("failed to initialize tracing subscriber: {err}"))?;
+
+    Ok(())
 }
