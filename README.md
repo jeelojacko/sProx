@@ -22,6 +22,7 @@ sProx/
 This repository currently contains the directory scaffolding only. Upcoming tasks will
 introduce the Rust crate setup, configuration loader, and the core proxy pipeline.
 
+
 ## Development tooling
 
 The workspace is configured to use a pinned stable toolchain defined in `rust-toolchain.toml`.
@@ -47,5 +48,12 @@ To prepare for future development, ensure that you have:
   `rustup show` inside the repository.
 - FFmpeg and/or Shaka Packager available on your development machine if you plan to exercise
   streaming conversion features later on.
+=======
+To prepare for future development, ensure that you have:
+
+- Rust toolchain (2021 edition or newer) installed via [rustup](https://rustup.rs/).
+- FFmpeg and/or Shaka Packager available on your development machine if you plan to
+  exercise streaming conversion features later on.
+
 
 Further documentation and setup steps will be added as the implementation progresses.

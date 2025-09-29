@@ -9,6 +9,8 @@ Cargo.lock
 !.vscode/
 !.vscode/settings.json
 !.vscode/extensions.json
+=======
+
 
 # Logs
 *.log
