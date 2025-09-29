@@ -1,0 +1,14 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.env
+
+# IDE
+.idea/
+.vscode/
+!.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Logs
+*.log
