@@ -3,4 +3,58 @@ name = "sProx"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = [
+    "http-proxy",
+    "config-loader",
+    "telemetry",
+]
+
+# Enable core HTTP proxy stack built on Axum/Tower.
+http-proxy = [
+    "dep:axum",
+    "dep:tower",
+    "dep:hyper",
+]
+
+# Enable configuration serialization/deserialization helpers.
+config-loader = [
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde_yaml",
+    "dep:config",
+]
+
+# Enable tracing/observability stack.
+telemetry = [
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+# Feature flag placeholders for upcoming media tooling.
+streaming-hls = ["dep:bytes"]
+streaming-dash = []
+
 [dependencies]
+anyhow = "1.0"
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "macros"], optional = true }
+bytes = { version = "1.5", optional = true }
+config = { version = "0.13", default-features = false, features = ["yaml", "toml"], optional = true }
+futures = "0.3"
+hyper = { version = "0.14", features = ["full"], optional = true }
+reqwest = { version = "=0.11.26", default-features = false, features = ["json", "stream"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+thiserror = "1.0"
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal"] }
+tower = { version = "0.4", features = ["util"], optional = true }
+tracing = { version = "0.1", features = ["std"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
+url = "=2.4.1"
+
+[dev-dependencies]
+serde_json = { version = "1.0" }
+serde_yaml = { version = "0.9" }
+tokio = { version = "1.38", features = ["macros", "rt"] }
+
