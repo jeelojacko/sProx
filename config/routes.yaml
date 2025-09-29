@@ -1,0 +1,47 @@
+# Sample routing configuration for sProx.
+# Copy this file and adjust values for your deployment. All durations are in milliseconds unless noted.
+routes:
+  - id: "vod-edge"
+    listen:
+      host: "0.0.0.0"
+      port: 8080
+    upstream:
+      origin: "https://origin.example.com/vod"
+      connect_timeout_ms: 2000
+      read_timeout_ms: 5000
+      tls:
+        enabled: true            # Toggle TLS when connecting to the upstream origin.
+        sni_hostname: "origin.example.com"  # Override the TLS SNI host if it differs from the origin.
+        insecure_skip_verify: false          # Set to true to skip certificate validation (not recommended in production).
+      socks5:
+        enabled: false           # Route outbound requests through a SOCKS5 proxy when true.
+        address: "127.0.0.1:1080" # SOCKS5 proxy endpoint in host:port format.
+        username: null           # Optional username for authenticated proxies.
+        password: null           # Optional password for authenticated proxies.
+    hls:
+      enabled: true              # Enable HLS-specific response handling (playlist rewriting, segment normalization, etc.).
+      rewrite_playlist_urls: true # Rewrites variant and segment URLs to the configured base_url.
+      base_url: "https://cdn.example.com/hls/" # Public base URL to emit inside generated playlists.
+      allow_insecure_segments: false # Allow http:// segment references even when upstream is https.
+  - id: "api-pass-through"
+    listen:
+      host: "127.0.0.1"
+      port: 9090
+    upstream:
+      origin: "http://internal-api.example.local"
+      connect_timeout_ms: 1000
+      read_timeout_ms: 3000
+      tls:
+        enabled: false           # Pure HTTP pass-through to an internal service.
+        sni_hostname: null
+        insecure_skip_verify: null
+      socks5:
+        enabled: false
+        address: null
+        username: null
+        password: null
+    hls:
+      enabled: false             # Leave disabled for non-streaming routes.
+      rewrite_playlist_urls: false
+      base_url: null
+      allow_insecure_segments: null
