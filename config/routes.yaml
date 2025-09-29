@@ -34,7 +34,7 @@ routes:
       tls:
         enabled: false           # Pure HTTP pass-through to an internal service.
         sni_hostname: null
-        insecure_skip_verify: null
+        insecure_skip_verify: false
       socks5:
         enabled: false
         address: null
@@ -44,4 +44,4 @@ routes:
       enabled: false             # Leave disabled for non-streaming routes.
       rewrite_playlist_urls: false
       base_url: null
-      allow_insecure_segments: null
+      allow_insecure_segments: false
