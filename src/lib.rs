@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod routing;
 pub mod security;
 pub mod state;
+pub mod stream;
 
 /// Initializes crate-level resources. The implementation will be
 /// provided in later steps once configuration loading and telemetry are

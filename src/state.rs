@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
+use url::Url;
 
 /// Identifier used to look up cached client metadata.
 pub type ClientId = String;
@@ -31,6 +32,8 @@ pub struct RouteTarget {
     pub tls_insecure_skip_verify: bool,
     /// Optional SOCKS5 proxy settings applied to outbound requests.
     pub socks5: Option<Socks5Proxy>,
+    /// Optional HLS processing configuration applied to responses.
+    pub hls: Option<HlsOptions>,
 }
 
 /// Configuration for tunneling outbound requests through a SOCKS5 proxy.
@@ -42,6 +45,21 @@ pub struct Socks5Proxy {
     pub username: Option<String>,
     /// Optional password used when proxy authentication is required.
     pub password: Option<String>,
+}
+
+/// Response processing settings for HTTP Live Streaming (HLS) manifests.
+#[derive(Debug, Clone, Default)]
+pub struct HlsOptions {
+    /// Toggle to enable HLS-specific manifest processing for the route.
+    pub enabled: bool,
+    /// When true playlist, segment, and key URIs will be rewritten to the
+    /// configured [`base_url`].
+    pub rewrite_playlist_urls: bool,
+    /// Base public URL that should be advertised within rewritten manifests.
+    pub base_url: Option<Url>,
+    /// Allow emitting manifest references that use the `http` scheme. This
+    /// should generally remain disabled for production traffic.
+    pub allow_insecure_segments: bool,
 }
 
 /// Representation of an opaque secret loaded from the configuration backend.
@@ -152,6 +170,7 @@ mod tests {
                 upstream: "https://example.com".into(),
                 tls_insecure_skip_verify: false,
                 socks5: None,
+                hls: None,
             },
         );
 

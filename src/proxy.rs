@@ -5,7 +5,7 @@ use axum::body::Body;
 use axum::extract::connect_info::ConnectInfo;
 use axum::http::{
     self,
-    header::{HeaderName, HeaderValue, HOST},
+    header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST},
     HeaderMap, Request, Response, Uri,
 };
 use futures::TryStreamExt;
@@ -21,6 +21,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::state::{AppState, RouteTarget};
+use crate::stream::hls;
 
 /// Errors that can occur while proxying a request.
 #[derive(Debug, Error)]
@@ -98,6 +99,18 @@ pub enum ProxyError {
         #[source]
         source: http::status::InvalidStatusCode,
     },
+
+    #[error("failed to read upstream response body: {source}")]
+    UpstreamBody {
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("failed to process HLS manifest: {source}")]
+    HlsProcessing {
+        #[source]
+        source: hls::HlsError,
+    },
 }
 
 /// Top-level entry point used by handlers to forward requests to the upstream target.
@@ -108,6 +121,7 @@ pub async fn forward(
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
     let route = lookup_route(&state, &host).await?;
     let upstream_url = build_upstream_url(&route, request.uri())?;
+    let manifest_url = upstream_url.clone();
     let upstream_scheme = upstream_url.scheme().to_string();
 
     let client = build_client(&route)?;
@@ -146,22 +160,56 @@ pub async fn forward(
             source,
         }
     })?;
-    let mut response_builder = Response::builder().status(status);
-    if let Some(headers) = response_builder.headers_mut() {
-        for (name, value) in upstream_response.headers().iter() {
-            let header_name = HeaderName::from_bytes(name.as_str().as_bytes())
-                .map_err(|source| ProxyError::InvalidInboundHeaderName { source })?;
-            let header_value = HeaderValue::from_bytes(value.as_bytes())
-                .map_err(|source| ProxyError::InvalidInboundHeaderValue { source })?;
-            headers.append(header_name, header_value);
-        }
+
+    let upstream_headers = upstream_response.headers().clone();
+    let mut header_entries = Vec::with_capacity(upstream_headers.len());
+    for (name, value) in upstream_headers.iter() {
+        let header_name = HeaderName::from_bytes(name.as_str().as_bytes())
+            .map_err(|source| ProxyError::InvalidInboundHeaderName { source })?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes())
+            .map_err(|source| ProxyError::InvalidInboundHeaderValue { source })?;
+        header_entries.push((header_name, header_value));
     }
 
-    let response_stream = upstream_response
-        .bytes_stream()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-        .into_stream();
-    let response_body = Body::from_stream(response_stream);
+    let should_process_hls = route
+        .hls
+        .as_ref()
+        .map(|cfg| cfg.enabled && is_hls_manifest(&upstream_headers, &manifest_url))
+        .unwrap_or(false);
+
+    let response_body = if should_process_hls {
+        let hls_config = route.hls.as_ref().expect("checked above");
+        let body_bytes = upstream_response
+            .bytes()
+            .await
+            .map_err(|source| ProxyError::UpstreamBody { source })?;
+
+        let rewritten = hls::rewrite_playlist(
+            &body_bytes,
+            &manifest_url,
+            hls_config.base_url.as_ref(),
+            hls_config.rewrite_playlist_urls,
+            hls_config.allow_insecure_segments,
+        )
+        .map_err(|source| ProxyError::HlsProcessing { source })?;
+
+        header_entries.retain(|(name, _)| name != CONTENT_LENGTH);
+
+        Body::from(rewritten)
+    } else {
+        let response_stream = upstream_response
+            .bytes_stream()
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+            .into_stream();
+        Body::from_stream(response_stream)
+    };
+
+    let mut response_builder = Response::builder().status(status);
+    if let Some(headers) = response_builder.headers_mut() {
+        for (name, value) in header_entries {
+            headers.append(name, value);
+        }
+    }
 
     response_builder
         .body(response_body)
@@ -243,6 +291,29 @@ fn build_upstream_url(route: &RouteTarget, uri: &Uri) -> Result<Url, ProxyError>
     Ok(base)
 }
 
+fn is_hls_manifest(headers: &reqwest::header::HeaderMap, url: &Url) -> bool {
+    if let Some(content_type) = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if matches_hls_content_type(content_type) {
+            return true;
+        }
+    }
+
+    url.path()
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.eq_ignore_ascii_case("m3u8"))
+        .unwrap_or(false)
+}
+
+fn matches_hls_content_type(value: &str) -> bool {
+    let normalized = value.trim();
+    normalized.eq_ignore_ascii_case("application/vnd.apple.mpegurl")
+        || normalized.eq_ignore_ascii_case("application/x-mpegurl")
+        || normalized.eq_ignore_ascii_case("audio/mpegurl")
+}
+
 fn prepare_upstream_headers(
     downstream: &HeaderMap,
     remote_addr: Option<SocketAddr>,
@@ -310,6 +381,7 @@ mod tests {
             upstream: "https://example.com/vod".to_string(),
             tls_insecure_skip_verify: false,
             socks5: None,
+            hls: None,
         };
         let uri: Uri = "/playlist.m3u8".parse().unwrap();
         let url = build_upstream_url(&target, &uri).unwrap();
