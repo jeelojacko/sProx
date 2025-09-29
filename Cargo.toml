@@ -39,7 +39,7 @@ streaming-dash = []
 
 [dependencies]
 anyhow = "1.0"
-axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "macros", "tokio"], optional = true }
+axum = { version = "0.7", default-features = false, features = ["http1", "http2", "json", "macros", "tokio", "query", "original-uri"], optional = true }
 bytes = { version = "1.5", optional = true }
 config = { version = "0.13", default-features = false, features = ["yaml", "toml"], optional = true }
 futures = "0.3"
@@ -51,6 +51,7 @@ base64 = "0.21"
 hmac = "0.12"
 ipnet = "2.9"
 rand = "0.8"
+roxmltree = "0.19"
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 serde_yaml = { version = "0.9", optional = true }
@@ -64,6 +65,7 @@ url = "=2.4.1"
 dotenvy = "0.15"
 sha2 = "0.10"
 subtle = "2.5"
+uuid = { version = "1", features = ["std"] }
 
 [dev-dependencies]
 serde_json = { version = "1.0" }
