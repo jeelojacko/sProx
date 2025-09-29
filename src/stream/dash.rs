@@ -307,6 +307,20 @@ fn find_key_entry(
 }
 
 fn decode_key_material(value: &str, key_name: &str) -> Result<Vec<u8>, DashError> {
+    if matches!(value.len(), 32 | 64) && value.chars().all(|c| c.is_ascii_hexdigit()) {
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for chunk in value.as_bytes().chunks(2) {
+            let hex = std::str::from_utf8(chunk).map_err(|_| DashError::InvalidStoredKey {
+                kid: key_name.to_string(),
+            })?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| DashError::InvalidStoredKey {
+                kid: key_name.to_string(),
+            })?;
+            bytes.push(byte);
+        }
+        return Ok(bytes);
+    }
+
     let decode_attempts = [
         URL_SAFE_NO_PAD.decode(value.as_bytes()),
         URL_SAFE.decode(value.as_bytes()),
@@ -320,20 +334,6 @@ fn decode_key_material(value: &str, key_name: &str) -> Result<Vec<u8>, DashError
                 kid: key_name.to_string(),
                 length: bytes.len(),
             });
-        }
-        return Ok(bytes);
-    }
-
-    if value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit()) {
-        let mut bytes = Vec::with_capacity(16);
-        for chunk in value.as_bytes().chunks(2) {
-            let hex = std::str::from_utf8(chunk).map_err(|_| DashError::InvalidStoredKey {
-                kid: key_name.to_string(),
-            })?;
-            let byte = u8::from_str_radix(hex, 16).map_err(|_| DashError::InvalidStoredKey {
-                kid: key_name.to_string(),
-            })?;
-            bytes.push(byte);
         }
         return Ok(bytes);
     }
@@ -454,5 +454,28 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(parsed["keys"][0]["kid"], kid_b64);
         assert_eq!(parsed["keys"][0]["k"], key_b64);
+    }
+
+    #[test]
+    fn decode_key_material_accepts_hex() {
+        let key_name = "test";
+        let hex_16 = "00112233445566778899aabbccddeeff";
+        let hex_32 = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+        let decoded_16 = decode_key_material(hex_16, key_name).expect("hex16 should decode");
+        assert_eq!(decoded_16.len(), 16);
+        let encoded_16: String = decoded_16
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect();
+        assert_eq!(encoded_16, hex_16);
+
+        let decoded_32 = decode_key_material(hex_32, key_name).expect("hex32 should decode");
+        assert_eq!(decoded_32.len(), 32);
+        let encoded_32: String = decoded_32
+            .iter()
+            .map(|byte| format!("{:02x}", byte))
+            .collect();
+        assert_eq!(encoded_32, hex_32);
     }
 }
