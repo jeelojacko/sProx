@@ -52,6 +52,7 @@ tower = { version = "0.4", features = ["util"], optional = true }
 tracing = { version = "0.1", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
 url = "=2.4.1"
+dotenvy = "0.15"
 
 [dev-dependencies]
 serde_json = { version = "1.0" }
