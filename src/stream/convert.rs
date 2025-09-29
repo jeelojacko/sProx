@@ -125,7 +125,7 @@ impl ConversionSummary {
 pub struct ConversionHandle {
     program: String,
     args: Vec<String>,
-    receiver: mpsc::Receiver<Result<Vec<u8>, ConversionStreamError>>,
+    receiver: mpsc::UnboundedReceiver<Result<Vec<u8>, ConversionStreamError>>,
     completion: JoinHandle<Result<ConversionSummary, ConversionError>>,
 }
 
@@ -254,7 +254,10 @@ pub async fn spawn_packager(command: PackagerCommand) -> Result<ConversionHandle
             program: program.clone(),
         })?;
 
-    let (sender, receiver) = mpsc::channel(32);
+    // Use an unbounded channel so stdout forwarding never blocks if the caller stops
+    // polling the stream but still awaits completion. Backpressure would otherwise cause
+    // the subprocess to deadlock once its stdout pipe fills.
+    let (sender, receiver) = mpsc::unbounded_channel();
 
     let stdout_handle = tokio::spawn(forward_stdout(stdout, program_for_stdout, sender));
     let stderr_handle = tokio::spawn(capture_stderr(stderr, program_for_stderr));
@@ -305,7 +308,7 @@ pub async fn spawn_packager(command: PackagerCommand) -> Result<ConversionHandle
 async fn forward_stdout(
     stdout: ChildStdout,
     program: String,
-    sender: mpsc::Sender<Result<Vec<u8>, ConversionStreamError>>,
+    sender: mpsc::UnboundedSender<Result<Vec<u8>, ConversionStreamError>>,
 ) -> Result<(), ConversionError> {
     let mut reader = BufReader::new(stdout);
 
@@ -315,13 +318,13 @@ async fn forward_stdout(
         match read_result {
             Ok(0) => break,
             Ok(_) => {
-                if sender.send(Ok(buffer)).await.is_err() {
+                if sender.send(Ok(buffer)).is_err() {
                     break;
                 }
             }
             Err(err) => {
                 let message = err.to_string();
-                let _ = sender.send(Err(ConversionStreamError::new(message))).await;
+                let _ = sender.send(Err(ConversionStreamError::new(message)));
                 return Err(ConversionError::ReadStdout {
                     program,
                     source: err,
