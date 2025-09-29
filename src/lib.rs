@@ -9,6 +9,7 @@
 pub mod app;
 #[cfg(feature = "config-loader")]
 pub mod config;
+pub mod proxy;
 pub mod routing;
 pub mod security;
 pub mod state;

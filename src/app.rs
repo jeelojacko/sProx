@@ -6,8 +6,9 @@
 //! steps of the project plan.
 
 use axum::{
+    body::Body,
     extract::State,
-    http::{StatusCode, Uri},
+    http::{Request, StatusCode},
     response::IntoResponse,
     routing::get,
     Router,
@@ -16,7 +17,10 @@ use axum::{
 #[cfg(feature = "telemetry")]
 use tower_http::trace::TraceLayer;
 
-use crate::state::AppState;
+use crate::{
+    proxy::{self, ProxyError},
+    state::AppState,
+};
 
 /// Constructs the Axum router used by the proxy.
 ///
@@ -82,12 +86,24 @@ async fn list_registered_keys(State(state): State<AppState>) -> impl IntoRespons
 
 /// Catch-all proxy handler used for routes that have not been explicitly
 /// registered.
-async fn proxy_fallback(State(state): State<AppState>, uri: Uri) -> impl IntoResponse {
-    let _ = state; // The state will be used once proxying is implemented.
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        format!("Proxying for `{uri}` has not been implemented yet."),
-    )
+async fn proxy_fallback(
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    match proxy::forward(state, request).await {
+        Ok(response) => response,
+        Err(error) => map_proxy_error(error),
+    }
+}
+
+fn map_proxy_error(error: ProxyError) -> axum::http::Response<Body> {
+    let status = match error {
+        ProxyError::MissingHost => StatusCode::BAD_REQUEST,
+        ProxyError::RouteNotFound { .. } => StatusCode::NOT_FOUND,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+
+    (status, error.to_string()).into_response()
 }
 
 /// Placeholder layer representing the future rate-limiting middleware.

@@ -26,6 +26,22 @@ pub struct RouteTarget {
     /// Endpoint of the upstream target. The placeholder is a bare string until
     /// connection pooling and TLS configuration are implemented.
     pub upstream: String,
+    /// When true certificate validation will be skipped for the upstream
+    /// request. This should only be enabled for local development.
+    pub tls_insecure_skip_verify: bool,
+    /// Optional SOCKS5 proxy settings applied to outbound requests.
+    pub socks5: Option<Socks5Proxy>,
+}
+
+/// Configuration for tunneling outbound requests through a SOCKS5 proxy.
+#[derive(Debug, Clone, Default)]
+pub struct Socks5Proxy {
+    /// Address of the SOCKS5 proxy in host:port format.
+    pub address: String,
+    /// Optional username used when proxy authentication is required.
+    pub username: Option<String>,
+    /// Optional password used when proxy authentication is required.
+    pub password: Option<String>,
 }
 
 /// Representation of an opaque secret loaded from the configuration backend.
@@ -134,6 +150,8 @@ mod tests {
             "route-a".into(),
             RouteTarget {
                 upstream: "https://example.com".into(),
+                tls_insecure_skip_verify: false,
+                socks5: None,
             },
         );
 
