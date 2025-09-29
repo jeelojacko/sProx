@@ -5,6 +5,7 @@
 //! workspace compiles while feature-gated dependencies are wired up.
 
 pub mod app;
+pub mod state;
 
 /// Initializes crate-level resources. The implementation will be
 /// provided in later steps once configuration loading and telemetry are
