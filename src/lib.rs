@@ -1,3 +1,5 @@
+#![allow(non_snake_case)]
+
 //! sProx library crate.
 //!
 //! The project currently exposes placeholder modules that will be
@@ -7,6 +9,7 @@
 pub mod app;
 #[cfg(feature = "config-loader")]
 pub mod config;
+pub mod routing;
 pub mod security;
 pub mod state;
 

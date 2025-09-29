@@ -33,7 +33,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/keys", get(list_registered_keys))
         .fallback(proxy_fallback)
         .with_state(state)
-        .layer(RateLimitLayer::default());
+        .layer(RateLimitLayer);
 
     #[cfg(feature = "telemetry")]
     let router = router.layer(TraceLayer::new_for_http());

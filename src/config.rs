@@ -132,7 +132,7 @@ struct RawUpstream {
     socks5: RawSocks5,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct RawTls {
     #[serde(default)]
     enabled: bool,
@@ -142,17 +142,7 @@ struct RawTls {
     insecure_skip_verify: bool,
 }
 
-impl Default for RawTls {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sni_hostname: None,
-            insecure_skip_verify: false,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct RawSocks5 {
     #[serde(default)]
     enabled: bool,
@@ -164,16 +154,7 @@ struct RawSocks5 {
     password: Option<String>,
 }
 
-impl Default for RawSocks5 {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: None,
-            username: None,
-            password: None,
-        }
-    }
-}
+// Default is derived above.
 
 #[derive(Debug, Deserialize)]
 struct RawHls {

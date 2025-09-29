@@ -126,7 +126,8 @@ mod tests {
             },
         );
 
-        let cached = state.clients_cache().read().await;
+        let clients_handle = state.clients_cache();
+        let cached = clients_handle.read().await;
         assert!(cached.contains_key("client-a"));
 
         state.routing_table().write().await.insert(
@@ -136,7 +137,8 @@ mod tests {
             },
         );
 
-        let routes = state.routing_table().read().await;
+        let routing_handle = state.routing_table();
+        let routes = routing_handle.read().await;
         assert_eq!(routes["route-a"].upstream, "https://example.com");
 
         state.secrets().write().await.insert(
@@ -146,7 +148,8 @@ mod tests {
             },
         );
 
-        let secrets = state.secrets().read().await;
+        let secrets_handle = state.secrets();
+        let secrets = secrets_handle.read().await;
         assert_eq!(secrets["api_key"].value, "super-secret");
     }
 }
