@@ -5,6 +5,8 @@
 //! workspace compiles while feature-gated dependencies are wired up.
 
 pub mod app;
+#[cfg(feature = "config-loader")]
+pub mod config;
 pub mod state;
 
 /// Initializes crate-level resources. The implementation will be
