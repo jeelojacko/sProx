@@ -7,6 +7,7 @@
 pub mod app;
 #[cfg(feature = "config-loader")]
 pub mod config;
+pub mod security;
 pub mod state;
 
 /// Initializes crate-level resources. The implementation will be
