@@ -29,6 +29,7 @@ config-loader = [
 telemetry = [
     "dep:tracing",
     "dep:tracing-subscriber",
+    "dep:tower-http",
 ]
 
 # Feature flag placeholders for upcoming media tooling.
@@ -49,6 +50,7 @@ serde_yaml = { version = "0.9", optional = true }
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal"] }
 tower = { version = "0.4", features = ["util"], optional = true }
+tower-http = { version = "0.5", features = ["trace"], optional = true }
 tracing = { version = "0.1", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
 url = "=2.4.1"
