@@ -20,6 +20,7 @@ use tower_http::trace::TraceLayer;
 use crate::{
     proxy::{self, ProxyError},
     state::AppState,
+    stream::dash,
 };
 
 /// Constructs the Axum router used by the proxy.
@@ -35,6 +36,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ip", get(report_client_ip))
         .route("/speedtest", get(speedtest_placeholder))
         .route("/keys", get(list_registered_keys))
+        .route("/keys/clearkey", get(dash::clearkey_jwks))
         .fallback(proxy_fallback)
         .with_state(state)
         .layer(RateLimitLayer);
