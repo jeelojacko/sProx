@@ -58,9 +58,19 @@ async fn main() -> Result<()> {
 fn build_app_state(config: &Config) -> Result<AppState> {
     let mut routing_table = HashMap::new();
     let mut route_definitions = Vec::with_capacity(config.routes.len());
+    let socks5_override = env::var("SPROX_PROXY_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
 
     for route in &config.routes {
-        let socks5 = if route.upstream.socks5.enabled {
+        let socks5 = if let Some(override_address) = socks5_override.as_ref() {
+            Some(Socks5Proxy {
+                address: override_address.clone(),
+                username: route.upstream.socks5.username.clone(),
+                password: route.upstream.socks5.password.clone(),
+            })
+        } else if route.upstream.socks5.enabled {
             route
                 .upstream
                 .socks5
