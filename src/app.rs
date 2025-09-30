@@ -6,18 +6,21 @@
 //! steps of the project plan.
 
 use axum::{
-    body::Body,
-    extract::State,
-    http::{Request, StatusCode},
-    response::IntoResponse,
+    body::{Body, Bytes},
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 
-#[cfg(feature = "telemetry")]
-use axum::http::{header, HeaderValue};
-#[cfg(feature = "telemetry")]
-use std::time::Instant;
+use std::{
+    convert::Infallible,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    task::{Context, Poll},
+    time::Instant,
+};
 #[cfg(feature = "telemetry")]
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 #[cfg(feature = "telemetry")]
@@ -44,7 +47,7 @@ pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health_check))
         .route("/ip", get(report_client_ip))
-        .route("/speedtest", get(speedtest_placeholder))
+        .route("/speedtest", get(speedtest))
         .route("/keys", get(list_registered_keys))
         .route("/keys/clearkey", get(dash::clearkey_jwks))
         .fallback(proxy_fallback)
@@ -90,20 +93,176 @@ async fn health_check() -> impl IntoResponse {
     StatusCode::OK
 }
 
-/// Returns a placeholder message for the caller's IP address.
-async fn report_client_ip() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        "IP discovery is not yet implemented. This is a placeholder response.",
-    )
+/// Resolves the caller's IP address from connection metadata and common proxy
+/// headers.
+async fn report_client_ip(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let resolved = resolve_client_ip(&headers, remote_addr);
+
+    (StatusCode::OK, resolved.to_string())
 }
 
-/// Placeholder speed-test handler.
-async fn speedtest_placeholder() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        "Speedtest endpoint is not yet available. Please try again later.",
-    )
+const SPEEDTEST_TOTAL_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+const SPEEDTEST_CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
+const SPEEDTEST_PATTERN: &[u8] = b"sprox-speedtest-data-";
+
+/// Streams deterministic bytes to the caller while logging the observed
+/// throughput.
+async fn speedtest() -> impl IntoResponse {
+    let stream = SpeedtestStream::new(SPEEDTEST_TOTAL_BYTES, SPEEDTEST_CHUNK_SIZE);
+    let body = Body::from_stream(stream);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )
+        .header(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&SPEEDTEST_TOTAL_BYTES.to_string())
+                .expect("valid content length"),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .body(body)
+        .expect("valid speedtest response")
+}
+
+fn resolve_client_ip(headers: &HeaderMap, remote_addr: SocketAddr) -> IpAddr {
+    forwarded_header_ip(headers)
+        .or_else(|| header_ip(headers, "x-forwarded-for"))
+        .or_else(|| header_ip(headers, "x-real-ip"))
+        .or_else(|| header_ip(headers, "cf-connecting-ip"))
+        .or_else(|| header_ip(headers, "x-client-ip"))
+        .unwrap_or_else(|| remote_addr.ip())
+}
+
+fn forwarded_header_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get(header::FORWARDED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value.split(',').find_map(|segment| {
+                segment
+                    .split(';')
+                    .find_map(|pair| match pair.trim().strip_prefix("for=") {
+                        Some(ip) => parse_ip_candidate(ip),
+                        None => None,
+                    })
+            })
+        })
+}
+
+fn header_ip(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| {
+            raw.split(',')
+                .map(|item| item.trim())
+                .find_map(parse_ip_candidate)
+        })
+}
+
+fn parse_ip_candidate(value: &str) -> Option<IpAddr> {
+    let trimmed = value.trim().trim_matches('"');
+
+    if trimmed.is_empty() || trimmed == "_" {
+        return None;
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Some(ip);
+    }
+
+    if let Ok(addr) = trimmed.parse::<SocketAddr>() {
+        return Some(addr.ip());
+    }
+
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.len() > 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if let Ok(ip) = inner.parse::<IpAddr>() {
+            return Some(ip);
+        }
+    }
+
+    None
+}
+
+struct SpeedtestStream {
+    remaining: usize,
+    chunk: Bytes,
+    sent: usize,
+    start: Instant,
+    finished: bool,
+}
+
+impl SpeedtestStream {
+    fn new(total_bytes: usize, chunk_size: usize) -> Self {
+        assert!(total_bytes > 0, "total bytes must be positive");
+        assert!(chunk_size > 0, "chunk size must be positive");
+
+        let mut pattern = Vec::with_capacity(chunk_size);
+        while pattern.len() < chunk_size {
+            let remaining = chunk_size - pattern.len();
+            let slice_len = remaining.min(SPEEDTEST_PATTERN.len());
+            pattern.extend_from_slice(&SPEEDTEST_PATTERN[..slice_len]);
+        }
+
+        Self {
+            remaining: total_bytes,
+            chunk: Bytes::from(pattern),
+            sent: 0,
+            start: Instant::now(),
+            finished: false,
+        }
+    }
+}
+
+impl futures::Stream for SpeedtestStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.remaining == 0 {
+            if !this.finished {
+                this.finished = true;
+                let elapsed = this.start.elapsed();
+                let seconds = elapsed.as_secs_f64();
+                let throughput = if seconds > 0.0 {
+                    this.sent as f64 / seconds
+                } else {
+                    f64::INFINITY
+                };
+
+                #[cfg(feature = "telemetry")]
+                tracing::info!(
+                    target = "speedtest",
+                    total_bytes = this.sent,
+                    elapsed_seconds = seconds,
+                    throughput_bytes_per_second = throughput,
+                    "completed speedtest stream"
+                );
+            }
+
+            return Poll::Ready(None);
+        }
+
+        let len = this.chunk.len().min(this.remaining);
+        let chunk = if len == this.chunk.len() {
+            this.chunk.clone()
+        } else {
+            this.chunk.slice(0..len)
+        };
+
+        this.remaining -= len;
+        this.sent += len;
+
+        Poll::Ready(Some(Ok(chunk)))
+    }
 }
 
 /// Lists the keys currently registered in the application's secret store.
@@ -224,7 +383,7 @@ impl<S> tower::Layer<S> for RateLimitLayer {
 mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
-    use axum::http::Request;
+    use axum::http::{HeaderMap, HeaderValue, Request};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
@@ -246,6 +405,91 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn report_client_ip_uses_connect_info_when_no_headers_present() {
+        let remote_addr: SocketAddr = "203.0.113.10:443".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let response = report_client_ip(ConnectInfo(remote_addr), headers)
+            .await
+            .into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"203.0.113.10");
+    }
+
+    #[tokio::test]
+    async fn report_client_ip_prefers_forwarded_header() {
+        let remote_addr: SocketAddr = "198.51.100.24:8080".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::FORWARDED,
+            HeaderValue::from_static("for=192.0.2.44;proto=https"),
+        );
+
+        let response = report_client_ip(ConnectInfo(remote_addr), headers)
+            .await
+            .into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"192.0.2.44");
+    }
+
+    #[tokio::test]
+    async fn report_client_ip_falls_back_to_x_forwarded_for() {
+        let remote_addr: SocketAddr = "198.51.100.50:9000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.8, 203.0.113.9"),
+        );
+
+        let response = report_client_ip(ConnectInfo(remote_addr), headers)
+            .await
+            .into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::OK);
+
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"203.0.113.8");
+    }
+
+    #[tokio::test]
+    async fn speedtest_streams_expected_payload() {
+        let app = build_router(AppState::new());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/speedtest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        assert_eq!(bytes.len(), SPEEDTEST_TOTAL_BYTES);
+        let payload = bytes.as_ref();
+        assert!(payload
+            .windows(SPEEDTEST_PATTERN.len())
+            .any(|window| window == SPEEDTEST_PATTERN));
     }
 
     #[tokio::test]
