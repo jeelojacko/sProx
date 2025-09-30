@@ -59,3 +59,8 @@ routes:
       rewrite_playlist_urls: false
       base_url: null
       allow_insecure_segments: false
+direct_stream:
+  proxy_url: null                # Optional HTTP proxy used for direct stream requests.
+  api_password: null             # Optional shared secret required when invoking the endpoint.
+  request_timeout_ms: 30000      # Timeout applied to upstream requests issued by the direct client.
+  response_buffer_bytes: 65536   # Initial HTTP/2 window sizes used when streaming responses.

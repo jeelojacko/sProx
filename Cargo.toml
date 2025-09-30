@@ -75,6 +75,7 @@ dotenvy = "0.15"
 sha2 = "0.10"
 subtle = "2.5"
 uuid = { version = "1", features = ["std"] }
+once_cell = "1.21"
 
 [dev-dependencies]
 serde_json = { version = "1.0" }

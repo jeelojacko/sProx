@@ -115,12 +115,18 @@ fn build_app_state(config: &Config) -> Result<AppState> {
 
     let routing_engine = Arc::new(RoutingEngine::new(route_definitions)?);
 
-    Ok(AppState::with_components(
+    let mut state = AppState::with_components(
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(RwLock::new(routing_table)),
         Arc::new(RwLock::new(HashMap::new())),
         routing_engine,
-    ))
+    );
+
+    if let Some(direct_stream) = config.direct_stream.clone() {
+        state = state.with_direct_stream_settings(direct_stream.into());
+    }
+
+    Ok(state)
 }
 
 fn primary_listener(config: &Config) -> Option<&ListenerConfig> {

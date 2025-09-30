@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
+use once_cell::sync::OnceCell;
+use reqwest::{Client, Proxy};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -132,6 +133,115 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Configuration applied to the direct stream proxy client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectStreamSettings {
+    proxy_url: Option<Url>,
+    api_password: Option<String>,
+    request_timeout: Duration,
+    response_buffer_bytes: usize,
+}
+
+impl DirectStreamSettings {
+    pub const DEFAULT_RESPONSE_BUFFER_BYTES: usize = 65_536;
+
+    pub fn default_request_timeout() -> Duration {
+        Duration::from_secs(30)
+    }
+
+    /// Returns the configured proxy URL when present.
+    pub fn proxy_url(&self) -> Option<&Url> {
+        self.proxy_url.as_ref()
+    }
+
+    /// Returns the configured API password when present.
+    pub fn api_password(&self) -> Option<&str> {
+        self.api_password.as_deref()
+    }
+
+    /// Returns the request timeout applied to outbound direct stream requests.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// Returns the configured HTTP/2 buffer settings in bytes.
+    pub fn response_buffer_bytes(&self) -> usize {
+        self.response_buffer_bytes
+    }
+}
+
+impl Default for DirectStreamSettings {
+    fn default() -> Self {
+        Self {
+            proxy_url: None,
+            api_password: None,
+            request_timeout: Self::default_request_timeout(),
+            response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
+        }
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::DirectStreamConfig> for DirectStreamSettings {
+    fn from(value: crate::config::DirectStreamConfig) -> Self {
+        Self {
+            proxy_url: value.proxy_url,
+            api_password: value.api_password,
+            request_timeout: value.request_timeout,
+            response_buffer_bytes: value.response_buffer_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DirectStreamState {
+    inner: Arc<DirectStreamStateInner>,
+}
+
+#[derive(Debug)]
+struct DirectStreamStateInner {
+    settings: DirectStreamSettings,
+    client: OnceCell<Client>,
+}
+
+impl DirectStreamState {
+    fn new(settings: DirectStreamSettings) -> Self {
+        Self {
+            inner: Arc::new(DirectStreamStateInner {
+                settings,
+                client: OnceCell::new(),
+            }),
+        }
+    }
+
+    fn settings(&self) -> &DirectStreamSettings {
+        &self.inner.settings
+    }
+
+    fn client(&self) -> Result<Client, reqwest::Error> {
+        self.inner
+            .client
+            .get_or_try_init(|| build_direct_stream_client(self.settings()))
+            .cloned()
+    }
+}
+
+fn build_direct_stream_client(settings: &DirectStreamSettings) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder().timeout(settings.request_timeout());
+
+    if let Some(proxy_url) = settings.proxy_url() {
+        builder = builder.proxy(Proxy::all(proxy_url.as_str())?);
+    }
+
+    if let Ok(window) = u32::try_from(settings.response_buffer_bytes()) {
+        builder = builder
+            .http2_initial_stream_window_size(Some(window))
+            .http2_initial_connection_window_size(Some(window));
+    }
+
+    builder.build()
+}
+
 /// Top-level application state shared across the Axum router and background
 /// workers.
 #[derive(Clone, Debug)]
@@ -142,6 +252,7 @@ pub struct AppState {
     rate_limit: RateLimitConfig,
     routing_engine: SharedRoutingEngine,
     http_client: Client,
+    direct_stream: Option<DirectStreamState>,
 }
 
 impl AppState {
@@ -166,6 +277,7 @@ impl AppState {
             rate_limit: RateLimitConfig::default(),
             routing_engine,
             http_client: Client::new(),
+            direct_stream: None,
         }
     }
 
@@ -199,6 +311,50 @@ impl AppState {
         self.rate_limit.clone()
     }
 
+    /// Applies a direct stream configuration to the state.
+    pub fn with_direct_stream_settings(mut self, settings: DirectStreamSettings) -> Self {
+        self.direct_stream = Some(DirectStreamState::new(settings));
+        self
+    }
+
+    /// Returns the configured proxy URL for direct stream requests when present.
+    pub fn direct_stream_proxy_url(&self) -> Option<&Url> {
+        self.direct_stream
+            .as_ref()
+            .and_then(|state| state.settings().proxy_url())
+    }
+
+    /// Returns the configured API password for direct stream requests when present.
+    pub fn direct_stream_api_password(&self) -> Option<&str> {
+        self.direct_stream
+            .as_ref()
+            .and_then(|state| state.settings().api_password())
+    }
+
+    /// Returns the request timeout applied to direct stream requests.
+    pub fn direct_stream_request_timeout(&self) -> Duration {
+        self.direct_stream
+            .as_ref()
+            .map(|state| state.settings().request_timeout())
+            .unwrap_or_else(DirectStreamSettings::default_request_timeout)
+    }
+
+    /// Returns the configured response buffer window in bytes.
+    pub fn direct_stream_response_buffer_bytes(&self) -> usize {
+        self.direct_stream
+            .as_ref()
+            .map(|state| state.settings().response_buffer_bytes())
+            .unwrap_or(DirectStreamSettings::DEFAULT_RESPONSE_BUFFER_BYTES)
+    }
+
+    /// Returns a clone of the reqwest client configured for direct stream requests.
+    pub fn direct_stream_client(&self) -> Result<Client, reqwest::Error> {
+        match self.direct_stream.as_ref() {
+            Some(state) => state.client(),
+            None => Ok(self.http_client()),
+        }
+    }
+
     /// Applies a custom rate limit configuration to the state.
     pub fn with_rate_limit_config(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = rate_limit;
@@ -224,6 +380,7 @@ impl Default for AppState {
                     .expect("routing engine should compile for empty routes"),
             ),
             http_client: Client::new(),
+            direct_stream: None,
         }
     }
 }
@@ -282,5 +439,36 @@ mod tests {
         let state = AppState::new().with_rate_limit_config(config.clone());
 
         assert_eq!(state.rate_limit_config(), config);
+    }
+
+    #[test]
+    fn app_state_exposes_direct_stream_configuration() {
+        let settings = DirectStreamSettings {
+            proxy_url: Some(Url::parse("http://proxy.example:3128").unwrap()),
+            api_password: Some("super-secret".into()),
+            request_timeout: Duration::from_secs(10),
+            response_buffer_bytes: 131_072,
+        };
+
+        let state = AppState::new().with_direct_stream_settings(settings.clone());
+
+        assert_eq!(
+            state.direct_stream_proxy_url().map(|url| url.as_str()),
+            Some("http://proxy.example:3128/")
+        );
+        assert_eq!(state.direct_stream_api_password(), Some("super-secret"));
+        assert_eq!(
+            state.direct_stream_request_timeout(),
+            settings.request_timeout()
+        );
+        assert_eq!(
+            state.direct_stream_response_buffer_bytes(),
+            settings.response_buffer_bytes()
+        );
+
+        let client = state
+            .direct_stream_client()
+            .expect("client should build successfully");
+        let _clone = client.clone();
     }
 }

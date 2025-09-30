@@ -23,6 +23,7 @@ use sProx::config::{Config, ListenerConfig, RouteConfig, Socks5Config, TlsConfig
 #[tokio::test]
 async fn health_endpoint_returns_success() {
     let config = Config {
+        direct_stream: None,
         routes: vec![RouteConfig {
             id: "health-check".into(),
             listen: ListenerConfig {
@@ -124,6 +125,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
         };
 
     let config = Config {
+        direct_stream: None,
         routes: vec![
             route_template("disabled-proxy", false, None),
             route_template("enabled-proxy", true, Some("10.0.0.1:9000")),
