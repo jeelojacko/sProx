@@ -30,6 +30,8 @@ use crate::{
     state::AppState,
     stream::dash,
 };
+#[cfg(feature = "telemetry")]
+use tracing::error;
 
 /// Constructs the Axum router used by the proxy.
 ///
@@ -156,7 +158,16 @@ fn map_proxy_error(error: ProxyError) -> axum::http::Response<Body> {
         _ => StatusCode::BAD_GATEWAY,
     };
 
-    (status, error.to_string()).into_response()
+    #[cfg(feature = "telemetry")]
+    error!(status = status.as_u16(), error = ?error, "proxy error encountered");
+
+    let message = match status.as_u16() {
+        400..=499 => "The request could not be processed.",
+        500..=599 => "The service encountered an upstream error.",
+        _ => "An unexpected error occurred.",
+    };
+
+    (status, message).into_response()
 }
 
 #[cfg(feature = "telemetry")]
@@ -212,9 +223,14 @@ impl<S> tower::Layer<S> for RateLimitLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
     use tower::ServiceExt; // for `oneshot`
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::fmt::MakeWriter;
+    use url::Url;
 
     #[tokio::test]
     async fn health_route_returns_success() {
@@ -230,5 +246,96 @@ mod tests {
             .expect("request should succeed");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn map_proxy_error_sanitizes_client_facing_response() {
+        let log_writer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log_writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let error = ProxyError::RouteNotFound {
+            host: "secret.internal".into(),
+        };
+
+        let response = with_default(subscriber, || map_proxy_error(error));
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+
+        let bytes = to_bytes(body, usize::MAX).await.expect("body to bytes");
+        let body_text = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert_eq!(body_text, "The request could not be processed.");
+        assert!(!body_text.contains("secret.internal"));
+
+        let logs = log_writer.contents();
+        assert!(logs.contains("secret.internal"));
+    }
+
+    #[tokio::test]
+    async fn map_proxy_error_logs_details_for_server_errors() {
+        let log_writer = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log_writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+
+        let source = Url::parse("::invalid::").unwrap_err();
+        let error = ProxyError::InvalidUpstreamUrl {
+            url: "http://upstream".into(),
+            source,
+        };
+
+        let response = with_default(subscriber, || map_proxy_error(error));
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::BAD_GATEWAY);
+
+        let bytes = to_bytes(body, usize::MAX).await.expect("body to bytes");
+        let body_text = String::from_utf8(bytes.to_vec()).expect("utf8 body");
+        assert_eq!(body_text, "The service encountered an upstream error.");
+
+        let logs = log_writer.contents();
+        assert!(logs.contains("InvalidUpstreamUrl"), "logs: {logs}");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedLogBuffer {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl SharedLogBuffer {
+        fn contents(&self) -> String {
+            let data = self.inner.lock().expect("log buffer lock").clone();
+            String::from_utf8_lossy(&data).into_owned()
+        }
+    }
+
+    struct SharedWriter {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self.inner.lock().expect("log buffer lock");
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedLogBuffer {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            SharedWriter {
+                inner: Arc::clone(&self.inner),
+            }
+        }
     }
 }
