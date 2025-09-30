@@ -1,6 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{connect_info::ConnectInfo, OriginalUri};
@@ -19,6 +19,7 @@ use reqwest::{
     Body as ReqwestBody, Client, ClientBuilder, Method as ReqwestMethod, Proxy as ReqwestProxy,
 };
 use thiserror::Error;
+use tracing::{error, info};
 use url::Url;
 
 use crate::state::{AppState, RouteTarget};
@@ -119,17 +120,33 @@ pub enum ProxyError {
 }
 
 /// Top-level entry point used by handlers to forward requests to the upstream target.
+#[tracing::instrument(
+    name = "proxy.forward",
+    skip(state, request),
+    fields(
+        route.id = tracing::field::Empty,
+        route.host = tracing::field::Empty,
+        upstream.url = tracing::field::Empty,
+        client.scheme = tracing::field::Empty
+    )
+)]
 pub async fn forward(
     state: AppState,
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
+    let span = tracing::Span::current();
+    span.record("route.id", &tracing::field::display(&host));
+    span.record("route.host", &tracing::field::display(&host));
+
     let route = lookup_route(&state, &host).await?;
     let upstream_url = build_upstream_url(&route, request.uri())?;
+    span.record("upstream.url", &tracing::field::display(&upstream_url));
     let manifest_url = upstream_url.clone();
     let upstream_scheme = upstream_url.scheme().to_string();
     let client_scheme =
         determine_client_scheme(&request).unwrap_or_else(|| upstream_scheme.clone());
+    span.record("client.scheme", &tracing::field::display(&client_scheme));
 
     let client = build_client(&route)?;
     let remote_addr = request
@@ -160,18 +177,40 @@ pub async fn forward(
         .into_stream();
     builder = builder.body(ReqwestBody::wrap_stream(body_stream));
 
-    let upstream_response = builder
-        .send()
-        .await
-        .map_err(|source| ProxyError::UpstreamRequest { source })?;
+    let request_start = Instant::now();
+    let upstream_response = match builder.send().await {
+        Ok(response) => response,
+        Err(source) => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                latency_ms,
+                error = %source,
+                "failed to forward request to upstream"
+            );
+            return Err(ProxyError::UpstreamRequest { source });
+        }
+    };
+
+    let latency = request_start.elapsed();
+    let latency_ms = latency.as_millis() as u64;
 
     let upstream_status = upstream_response.status();
-    let status = http::StatusCode::from_u16(upstream_status.as_u16()).map_err(|source| {
-        ProxyError::InvalidStatusCode {
-            code: upstream_status.as_u16(),
-            source,
+    let status = match http::StatusCode::from_u16(upstream_status.as_u16()) {
+        Ok(status) => status,
+        Err(source) => {
+            error!(
+                latency_ms,
+                status_code = upstream_status.as_u16(),
+                "invalid status returned by upstream"
+            );
+            return Err(ProxyError::InvalidStatusCode {
+                code: upstream_status.as_u16(),
+                source,
+            });
         }
-    })?;
+    };
+
+    info!(status = %status, latency_ms, "forwarded upstream response");
 
     let upstream_headers = upstream_response.headers().clone();
     let mut header_entries = Vec::with_capacity(upstream_headers.len());
@@ -510,11 +549,18 @@ mod tests {
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio::time::sleep;
+    use tracing::field::{Field, Visit};
+    use tracing::span::Id;
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Registry;
 
     async fn spawn_delayed_http_server(
         delay: Duration,
@@ -822,5 +868,198 @@ mod tests {
         }
 
         let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn forward_records_tracing_metadata() {
+        let (addr, shutdown) = spawn_delayed_http_server(Duration::from_millis(0)).await;
+
+        let route = RouteTarget {
+            upstream: format!("http://{}", addr),
+            connect_timeout: Some(Duration::from_secs(1)),
+            read_timeout: Some(Duration::from_secs(1)),
+            request_timeout: Some(Duration::from_secs(1)),
+            tls_insecure_skip_verify: false,
+            socks5: None,
+            hls: None,
+        };
+
+        let state = AppState::new();
+        state
+            .routing_table()
+            .write()
+            .await
+            .insert("trace.test".into(), route);
+
+        let request = Request::builder()
+            .uri("http://trace.test/")
+            .header(HOST, "trace.test")
+            .body(Body::empty())
+            .unwrap();
+
+        let spans: Arc<Mutex<HashMap<u64, RecordedSpan>>> = Arc::new(Mutex::new(HashMap::new()));
+        let events: Arc<Mutex<Vec<RecordedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let layer = TestLayer::new(Arc::clone(&spans), Arc::clone(&events));
+        let subscriber = Registry::default().with(layer);
+        let _guard = set_default(subscriber);
+
+        let response = forward(state.clone(), request)
+            .await
+            .expect("forward should succeed");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let spans_guard = spans.lock().expect("span collection should be accessible");
+        let forward_span = spans_guard
+            .values()
+            .find(|span| span.name == "proxy.forward")
+            .expect("forward span should be recorded");
+
+        assert!(forward_span
+            .fields
+            .get("route.id")
+            .map(|value| value.contains("trace.test"))
+            .unwrap_or(false));
+        assert!(forward_span
+            .fields
+            .get("route.host")
+            .map(|value| value.contains("trace.test"))
+            .unwrap_or(false));
+
+        let expected_upstream = format!("http://{}/", addr);
+        assert!(forward_span
+            .fields
+            .get("upstream.url")
+            .map(|value| value.contains(&expected_upstream))
+            .unwrap_or(false));
+        assert!(forward_span
+            .fields
+            .get("client.scheme")
+            .map(|value| value.contains("http"))
+            .unwrap_or(false));
+        drop(spans_guard);
+
+        let events_guard = events
+            .lock()
+            .expect("event collection should be accessible");
+        let response_event = events_guard
+            .iter()
+            .find(|event| {
+                event
+                    .fields
+                    .get("message")
+                    .map(|message| message == "forwarded upstream response")
+                    .unwrap_or(false)
+            })
+            .expect("response event should be recorded");
+
+        assert!(response_event
+            .fields
+            .get("status")
+            .map(|value| value.contains("200"))
+            .unwrap_or(false));
+
+        response_event
+            .fields
+            .get("latency_ms")
+            .expect("latency should be recorded")
+            .parse::<u64>()
+            .expect("latency should be numeric");
+        drop(events_guard);
+
+        let _ = shutdown.send(());
+    }
+
+    struct RecordedSpan {
+        name: String,
+        fields: HashMap<String, String>,
+    }
+
+    struct RecordedEvent {
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: HashMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_bool(&mut self, field: &Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestLayer {
+        spans: Arc<Mutex<HashMap<u64, RecordedSpan>>>,
+        events: Arc<Mutex<Vec<RecordedEvent>>>,
+    }
+
+    impl TestLayer {
+        fn new(
+            spans: Arc<Mutex<HashMap<u64, RecordedSpan>>>,
+            events: Arc<Mutex<Vec<RecordedEvent>>>,
+        ) -> Self {
+            Self { spans, events }
+        }
+    }
+
+    impl<S> tracing_subscriber::layer::Layer<S> for TestLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &Id, _: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            attrs.record(&mut visitor);
+            let recorded = RecordedSpan {
+                name: attrs.metadata().name().to_string(),
+                fields: visitor.fields,
+            };
+            if let Ok(mut spans) = self.spans.lock() {
+                spans.insert(id.into_u64(), recorded);
+            }
+        }
+
+        fn on_record(&self, id: &Id, values: &tracing::span::Record<'_>, _: Context<'_, S>) {
+            if let Ok(mut spans) = self.spans.lock() {
+                if let Some(span) = spans.get_mut(&id.into_u64()) {
+                    let mut visitor = FieldVisitor::default();
+                    values.record(&mut visitor);
+                    span.fields.extend(visitor.fields);
+                }
+            }
+        }
+
+        fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            if let Ok(mut events) = self.events.lock() {
+                events.push(RecordedEvent {
+                    fields: visitor.fields,
+                });
+            }
+        }
     }
 }
