@@ -2,10 +2,10 @@ use std::io;
 use std::net::SocketAddr;
 
 use axum::body::Body;
-use axum::extract::connect_info::ConnectInfo;
+use axum::extract::{connect_info::ConnectInfo, OriginalUri};
 use axum::http::{
     self,
-    header::{HeaderName, HeaderValue, CONTENT_LENGTH, HOST},
+    header::{HeaderName, HeaderValue, CONTENT_LENGTH, FORWARDED, HOST},
     HeaderMap, Request, Response, Uri,
 };
 use futures::TryStreamExt;
@@ -123,14 +123,15 @@ pub async fn forward(
     let upstream_url = build_upstream_url(&route, request.uri())?;
     let manifest_url = upstream_url.clone();
     let upstream_scheme = upstream_url.scheme().to_string();
+    let client_scheme =
+        determine_client_scheme(&request).unwrap_or_else(|| upstream_scheme.clone());
 
     let client = build_client(&route)?;
     let remote_addr = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
-    let headers =
-        prepare_upstream_headers(request.headers(), remote_addr, &host, &upstream_scheme)?;
+    let headers = prepare_upstream_headers(request.headers(), remote_addr, &host, &client_scheme)?;
 
     let method = ReqwestMethod::from_bytes(request.method().as_str().as_bytes()).map_err(|_| {
         ProxyError::UnsupportedMethod {
@@ -225,6 +226,70 @@ fn extract_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string())
+}
+
+fn determine_client_scheme(request: &Request<Body>) -> Option<String> {
+    if let Some(scheme) = request.uri().scheme_str() {
+        if let Some(normalized) = normalize_scheme(scheme) {
+            return Some(normalized);
+        }
+    }
+
+    if let Some(original_uri) = request.extensions().get::<OriginalUri>() {
+        if let Some(scheme) = original_uri.0.scheme_str() {
+            if let Some(normalized) = normalize_scheme(scheme) {
+                return Some(normalized);
+            }
+        }
+    }
+
+    if let Some(value) = request.headers().get(FORWARDED) {
+        if let Ok(value) = value.to_str() {
+            if let Some(scheme) = parse_forwarded_proto(value) {
+                return Some(scheme);
+            }
+        }
+    }
+
+    let forwarded_proto = HeaderName::from_static("x-forwarded-proto");
+    if let Some(value) = request.headers().get(&forwarded_proto) {
+        if let Ok(value) = value.to_str() {
+            if let Some(scheme) = parse_x_forwarded_proto(value) {
+                return Some(scheme);
+            }
+        }
+    }
+
+    None
+}
+
+fn normalize_scheme(value: &str) -> Option<String> {
+    if value.eq_ignore_ascii_case("http") {
+        Some(String::from("http"))
+    } else if value.eq_ignore_ascii_case("https") {
+        Some(String::from("https"))
+    } else {
+        None
+    }
+}
+
+fn parse_forwarded_proto(header: &str) -> Option<String> {
+    header.split(',').find_map(|segment| {
+        segment.split(';').find_map(|pair| match pair.trim() {
+            value if value.len() >= 6 && value[..6].eq_ignore_ascii_case("proto=") => {
+                let proto = value[6..].trim_matches('"');
+                normalize_scheme(proto)
+            }
+            _ => None,
+        })
+    })
+}
+
+fn parse_x_forwarded_proto(header: &str) -> Option<String> {
+    header
+        .split(',')
+        .map(|value| value.trim())
+        .find_map(normalize_scheme)
 }
 
 async fn lookup_route(state: &AppState, host: &str) -> Result<RouteTarget, ProxyError> {
@@ -372,7 +437,7 @@ fn prepare_upstream_headers(
 mod tests {
     use super::*;
     use axum::http::header::HeaderValue;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
 
     #[test]
@@ -428,5 +493,67 @@ mod tests {
                 .unwrap(),
             "203.0.113.1, 198.51.100.10"
         );
+    }
+
+    #[test]
+    fn client_scheme_prefers_request_uri() {
+        let request = Request::builder()
+            .uri("https://cdn.example.com/video")
+            .body(Body::empty())
+            .unwrap();
+
+        let scheme = determine_client_scheme(&request).expect("scheme should be detected");
+        assert_eq!(scheme, "https");
+    }
+
+    #[test]
+    fn client_scheme_falls_back_to_original_uri_extension() {
+        let mut request = Request::builder()
+            .uri("/playlist.m3u8")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(OriginalUri(Uri::from_static(
+                "https://cdn.example.com/playlist.m3u8",
+            )));
+
+        let scheme = determine_client_scheme(&request).expect("scheme should be detected");
+        assert_eq!(scheme, "https");
+    }
+
+    #[test]
+    fn client_scheme_reads_forwarded_header() {
+        let request = Request::builder()
+            .uri("/video")
+            .header(FORWARDED, "for=198.51.100.10; proto=https")
+            .body(Body::empty())
+            .unwrap();
+
+        let scheme = determine_client_scheme(&request).expect("scheme should be detected");
+        assert_eq!(scheme, "https");
+    }
+
+    #[test]
+    fn client_scheme_reads_x_forwarded_proto_header() {
+        let request = Request::builder()
+            .uri("/video")
+            .header("x-forwarded-proto", "https, http")
+            .body(Body::empty())
+            .unwrap();
+
+        let scheme = determine_client_scheme(&request).expect("scheme should be detected");
+        assert_eq!(scheme, "https");
+    }
+
+    #[test]
+    fn client_scheme_ignores_unknown_values() {
+        let request = Request::builder()
+            .uri("/video")
+            .header("x-forwarded-proto", "ftp")
+            .body(Body::empty())
+            .unwrap();
+
+        assert!(determine_client_scheme(&request).is_none());
     }
 }
