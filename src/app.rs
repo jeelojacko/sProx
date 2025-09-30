@@ -15,7 +15,15 @@ use axum::{
 };
 
 #[cfg(feature = "telemetry")]
-use tower_http::trace::TraceLayer;
+use axum::http::{header, HeaderValue};
+#[cfg(feature = "telemetry")]
+use std::time::Instant;
+#[cfg(feature = "telemetry")]
+use tower_http::trace::{DefaultOnResponse, TraceLayer};
+#[cfg(feature = "telemetry")]
+use tower_http::LatencyUnit;
+#[cfg(feature = "telemetry")]
+use tracing::Level;
 
 use crate::{
     proxy::{self, ProxyError},
@@ -42,13 +50,41 @@ pub fn build_router(state: AppState) -> Router {
         .layer(RateLimitLayer);
 
     #[cfg(feature = "telemetry")]
-    let router = router.layer(TraceLayer::new_for_http());
+    let router = router.route("/metrics", get(prometheus_metrics));
+
+    #[cfg(feature = "telemetry")]
+    let router = router.layer(
+        TraceLayer::new_for_http()
+            .make_span_with(|request: &Request<Body>| {
+                let user_agent = request
+                    .headers()
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("-");
+
+                tracing::info_span!(
+                    "http.request",
+                    method = %request.method(),
+                    uri = %request.uri(),
+                    version = ?request.version(),
+                    user_agent = %user_agent,
+                )
+            })
+            .on_response(
+                DefaultOnResponse::new()
+                    .level(Level::INFO)
+                    .latency_unit(LatencyUnit::Millis),
+            ),
+    );
 
     router
 }
 
 /// Basic health-check handler used for readiness probes.
 async fn health_check() -> impl IntoResponse {
+    #[cfg(feature = "telemetry")]
+    metrics::counter!("sprox_health_checks_total").increment(1);
+
     StatusCode::OK
 }
 
@@ -92,9 +128,24 @@ async fn proxy_fallback(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> impl IntoResponse {
+    #[cfg(feature = "telemetry")]
+    let start = Instant::now();
+
     match proxy::forward(state, request).await {
-        Ok(response) => response,
-        Err(error) => map_proxy_error(error),
+        Ok(response) => {
+            #[cfg(feature = "telemetry")]
+            record_http_metrics("proxy_fallback", response.status(), start.elapsed());
+
+            response
+        }
+        Err(error) => {
+            let response = map_proxy_error(error);
+
+            #[cfg(feature = "telemetry")]
+            record_http_metrics("proxy_fallback", response.status(), start.elapsed());
+
+            response
+        }
     }
 }
 
@@ -106,6 +157,44 @@ fn map_proxy_error(error: ProxyError) -> axum::http::Response<Body> {
     };
 
     (status, error.to_string()).into_response()
+}
+
+#[cfg(feature = "telemetry")]
+async fn prometheus_metrics() -> impl IntoResponse {
+    match crate::scrape_metrics() {
+        Some(body) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; version=0.0.4"),
+            )],
+            body,
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics recorder unavailable",
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "telemetry")]
+fn record_http_metrics(route: &str, status: StatusCode, latency: std::time::Duration) {
+    let status_label = status.as_u16().to_string();
+
+    metrics::counter!(
+        "sprox_http_responses_total",
+        "route" => route.to_owned(),
+        "status" => status_label.clone(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sprox_http_response_duration_seconds",
+        "route" => route.to_owned(),
+        "status" => status_label,
+    )
+    .record(latency.as_secs_f64());
 }
 
 /// Placeholder layer representing the future rate-limiting middleware.
