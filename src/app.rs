@@ -29,10 +29,11 @@ use tower_http::LatencyUnit;
 #[cfg(feature = "telemetry")]
 use tracing::Level;
 
+#[cfg(feature = "drm")]
+use crate::stream::dash;
 use crate::{
     proxy::{self, ProxyError},
     state::{AppState, RateLimitConfig},
-    stream::dash,
 };
 use futures::future::BoxFuture;
 use tower::limit::rate::{RateLimit, RateLimitLayer as TowerRateLimitLayer};
@@ -53,8 +54,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/ip", get(report_client_ip))
         .route("/speedtest", get(speedtest))
-        .route("/keys", get(list_registered_keys))
-        .route("/keys/clearkey", get(dash::clearkey_jwks))
+        .route("/keys", get(list_registered_keys));
+
+    #[cfg(feature = "drm")]
+    let router = router.route("/keys/clearkey", get(dash::clearkey_jwks));
+
+    let router = router
         .fallback(proxy_fallback)
         .with_state(state)
         .layer(rate_limit_layer);

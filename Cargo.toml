@@ -8,6 +8,7 @@ default = [
     "http-proxy",
     "config-loader",
     "telemetry",
+    "drm",
 ]
 
 # Enable core HTTP proxy stack built on Axum/Tower.
@@ -34,6 +35,9 @@ telemetry = [
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
 ]
+
+# Enable DRM-specific functionality such as Clear Key handling.
+drm = ["http-proxy"]
 
 # Feature flag placeholders for upcoming media tooling.
 streaming-hls = ["dep:bytes"]

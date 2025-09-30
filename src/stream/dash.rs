@@ -1,27 +1,40 @@
 use std::collections::HashSet;
 
+#[cfg(feature = "drm")]
 use axum::{
     extract::{Host, OriginalUri, Query, State},
-    http::{header, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    http::{header, HeaderValue},
     Json,
 };
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
+#[cfg(feature = "drm")]
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+#[cfg(feature = "drm")]
 use base64::Engine;
 use roxmltree::Document;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use url::Url;
 use uuid::Uuid;
 
+use crate::security::SecurityError;
+#[cfg(feature = "drm")]
 use crate::{
-    security::{self, SecurityError},
+    security,
     state::{AppState, SecretValue},
 };
+#[cfg(feature = "drm")]
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "drm")]
+use url::Url;
 
 const CENC_NAMESPACE: &str = "urn:mpeg:cenc:2013";
+#[cfg(feature = "drm")]
 const CLEARKEY_SECRET_PREFIX: &str = "clearkey:";
+#[cfg(feature = "drm")]
 const CLEARKEY_SIGNING_SECRET: &str = "clearkey:signing_secret";
+#[cfg(feature = "drm")]
 const SIGNATURE_PARAM: &str = "sig";
 
 /// Errors that can occur while processing DASH manifests or Clear Key requests.
@@ -143,6 +156,7 @@ pub fn extract_default_kids(mpd: &str) -> Result<Vec<Uuid>, DashError> {
 /// Requests must include a `kid` query parameter identifying the key and a `sig`
 /// parameter carrying the HMAC-SHA256 signature generated with the configured
 /// signing secret. Only requests with valid signatures return key material.
+#[cfg(feature = "drm")]
 pub async fn clearkey_jwks(
     State(state): State<AppState>,
     Host(host): Host,
@@ -193,6 +207,7 @@ pub async fn clearkey_jwks(
     Ok(response)
 }
 
+#[cfg(feature = "drm")]
 fn build_request_url(host: &str, original_uri: &axum::http::Uri) -> Result<Url, DashError> {
     let scheme = "https";
     let uri_str = original_uri.to_string();
@@ -201,6 +216,7 @@ fn build_request_url(host: &str, original_uri: &axum::http::Uri) -> Result<Url, 
     Ok(url)
 }
 
+#[cfg(feature = "drm")]
 #[derive(Debug, Deserialize)]
 pub struct ClearKeyQuery {
     kid: String,
@@ -210,6 +226,7 @@ pub struct ClearKeyQuery {
     _exp: Option<String>,
 }
 
+#[cfg(feature = "drm")]
 fn decode_kid(kid: &str) -> Result<[u8; 16], DashError> {
     if let Ok(uuid) = Uuid::parse_str(kid) {
         return Ok(*uuid.as_bytes());
@@ -257,6 +274,7 @@ fn decode_kid(kid: &str) -> Result<[u8; 16], DashError> {
     })
 }
 
+#[cfg(feature = "drm")]
 fn find_key_entry(
     secrets: &std::collections::HashMap<String, SecretValue>,
     provided_kid: &str,
@@ -306,6 +324,7 @@ fn find_key_entry(
     })
 }
 
+#[cfg(feature = "drm")]
 fn decode_key_material(value: &str, key_name: &str) -> Result<Vec<u8>, DashError> {
     if matches!(value.len(), 32 | 64) && value.chars().all(|c| c.is_ascii_hexdigit()) {
         let mut bytes = Vec::with_capacity(value.len() / 2);
@@ -343,11 +362,13 @@ fn decode_key_material(value: &str, key_name: &str) -> Result<Vec<u8>, DashError
     })
 }
 
+#[cfg(feature = "drm")]
 #[derive(Debug, Serialize)]
 struct JsonWebKeySet {
     keys: Vec<JsonWebKey>,
 }
 
+#[cfg(feature = "drm")]
 #[derive(Debug, Serialize)]
 struct JsonWebKey {
     kty: &'static str,
@@ -358,12 +379,6 @@ struct JsonWebKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use std::fmt::Write;
-    use tower::ServiceExt;
-
-    use crate::state::{AppState, SecretValue};
 
     #[test]
     fn extracts_default_kids_from_manifest() {
@@ -392,6 +407,19 @@ mod tests {
         let error = extract_default_kids(mpd).expect_err("should fail");
         assert!(matches!(error, DashError::MissingDefaultKids));
     }
+}
+
+#[cfg(all(test, feature = "drm"))]
+mod drm_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use std::fmt::Write;
+    use tower::ServiceExt;
+
+    use crate::state::{AppState, SecretValue};
 
     #[tokio::test]
     async fn clearkey_handler_returns_jwk() {

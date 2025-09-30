@@ -159,6 +159,15 @@ added as the implementation matures. For interim guidance consult
    - Once the binary exposes runtime flags, start the proxy with
      `cargo run -- --config config/routes.yaml`.
 
+### Cargo feature flags
+
+- `drm` – Enables DRM-specific functionality, including the Clear Key JWKS endpoint
+  and associated secret store plumbing. The flag is enabled by default to preserve the
+  existing developer experience, but Real-Debrid/AllDebrid style deployments should
+  disable it to avoid exposing DRM routes. Build with
+  `cargo build --no-default-features --features "http-proxy config-loader telemetry"`
+  (or the subset of features you require) to run without DRM support.
+
 ## Environment variables
 
 The proxy reads sensitive runtime configuration from environment variables. Copy
