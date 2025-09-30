@@ -9,6 +9,7 @@ routes:
       origin: "https://origin.example.com/vod"
       connect_timeout_ms: 2000
       read_timeout_ms: 5000
+      request_timeout_ms: 8000
       tls:
         enabled: true            # Toggle TLS when connecting to the upstream origin.
         sni_hostname: "origin.example.com"  # Override the TLS SNI host if it differs from the origin.
@@ -31,6 +32,7 @@ routes:
       origin: "http://internal-api.example.local"
       connect_timeout_ms: 1000
       read_timeout_ms: 3000
+      request_timeout_ms: 4000
       tls:
         enabled: false           # Pure HTTP pass-through to an internal service.
         sni_hostname: null

@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{connect_info::ConnectInfo, OriginalUri};
@@ -15,13 +16,17 @@ use reqwest::{
         HeaderValue as ReqwestHeaderValue,
     },
     redirect::Policy,
-    Body as ReqwestBody, Client, Method as ReqwestMethod, Proxy as ReqwestProxy,
+    Body as ReqwestBody, Client, ClientBuilder, Method as ReqwestMethod, Proxy as ReqwestProxy,
 };
 use thiserror::Error;
 use url::Url;
 
 use crate::state::{AppState, RouteTarget};
 use crate::stream::hls;
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors that can occur while proxying a request.
 #[derive(Debug, Error)]
@@ -141,6 +146,12 @@ pub async fn forward(
 
     let mut builder = client.request(method, upstream_url);
     builder = builder.headers(headers);
+
+    let request_timeout = route
+        .request_timeout
+        .or(route.read_timeout)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    builder = builder.timeout(request_timeout);
 
     let body_stream = request
         .into_body()
@@ -357,6 +368,7 @@ fn build_client(route: &RouteTarget) -> Result<Client, ProxyError> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .danger_accept_invalid_certs(route.tls_insecure_skip_verify);
+    builder = apply_client_timeouts(builder, route);
 
     if let Some(proxy) = &route.socks5 {
         if !proxy.address.is_empty() {
@@ -373,6 +385,15 @@ fn build_client(route: &RouteTarget) -> Result<Client, ProxyError> {
     builder
         .build()
         .map_err(|source| ProxyError::ClientBuild { source })
+}
+
+fn apply_client_timeouts(builder: ClientBuilder, route: &RouteTarget) -> ClientBuilder {
+    let connect_timeout = route.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
+    let read_timeout = route.read_timeout.unwrap_or(DEFAULT_READ_TIMEOUT);
+
+    builder
+        .connect_timeout(connect_timeout)
+        .timeout(read_timeout)
 }
 
 fn build_upstream_url(route: &RouteTarget, uri: &Uri) -> Result<Url, ProxyError> {
@@ -489,6 +510,63 @@ mod tests {
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
+
+    async fn spawn_delayed_http_server(
+        delay: Duration,
+    ) -> (std::net::SocketAddr, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    accept = listener.accept() => {
+                        let (mut stream, _) = match accept {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        };
+
+                        let mut buffer = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buffer.extend_from_slice(&chunk[..n]);
+                                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    return;
+                                }
+                            }
+                        }
+
+                        sleep(delay).await;
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                    }
+                }
+            }
+        });
+
+        (addr, shutdown_tx)
+    }
 
     #[test]
     fn extract_host_from_uri_with_port() {
@@ -526,6 +604,9 @@ mod tests {
     fn build_upstream_url_joins_paths() {
         let target = RouteTarget {
             upstream: "https://example.com/vod".to_string(),
+            connect_timeout: None,
+            read_timeout: None,
+            request_timeout: None,
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
@@ -637,5 +718,109 @@ mod tests {
             .unwrap();
 
         assert!(determine_client_scheme(&request).is_none());
+    }
+
+    #[test]
+    fn client_builder_applies_configured_timeouts() {
+        let route = RouteTarget {
+            upstream: "http://example.com".into(),
+            connect_timeout: Some(Duration::from_millis(150)),
+            read_timeout: Some(Duration::from_millis(450)),
+            request_timeout: None,
+            tls_insecure_skip_verify: false,
+            socks5: None,
+            hls: None,
+        };
+
+        let builder = apply_client_timeouts(Client::builder(), &route);
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("connect_timeout"));
+        assert!(debug.contains("150ms"));
+        assert!(debug.contains("timeout"));
+        assert!(debug.contains("450ms"));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_enforced_for_slow_upstream() {
+        let delay = Duration::from_millis(250);
+        let (addr, shutdown) = spawn_delayed_http_server(delay).await;
+
+        let route = RouteTarget {
+            upstream: format!("http://{}", addr),
+            connect_timeout: Some(Duration::from_secs(1)),
+            read_timeout: Some(Duration::from_millis(500)),
+            request_timeout: Some(Duration::from_millis(100)),
+            tls_insecure_skip_verify: false,
+            socks5: None,
+            hls: None,
+        };
+
+        let state = AppState::new();
+        state
+            .routing_table()
+            .write()
+            .await
+            .insert("timeout.test".into(), route);
+
+        let request = Request::builder()
+            .uri("http://timeout.test/playlist.m3u8")
+            .header(HOST, "timeout.test")
+            .body(Body::empty())
+            .unwrap();
+
+        let error = forward(state.clone(), request)
+            .await
+            .expect_err("upstream call should time out");
+
+        match error {
+            ProxyError::UpstreamRequest { source } => {
+                assert!(source.is_timeout(), "unexpected error: {source:?}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn read_timeout_is_used_when_request_timeout_missing() {
+        let delay = Duration::from_millis(250);
+        let (addr, shutdown) = spawn_delayed_http_server(delay).await;
+
+        let route = RouteTarget {
+            upstream: format!("http://{}", addr),
+            connect_timeout: Some(Duration::from_secs(1)),
+            read_timeout: Some(Duration::from_millis(120)),
+            request_timeout: None,
+            tls_insecure_skip_verify: false,
+            socks5: None,
+            hls: None,
+        };
+
+        let state = AppState::new();
+        state
+            .routing_table()
+            .write()
+            .await
+            .insert("timeout.test".into(), route);
+
+        let request = Request::builder()
+            .uri("http://timeout.test/index.m3u8")
+            .header(HOST, "timeout.test")
+            .body(Body::empty())
+            .unwrap();
+
+        let error = forward(state.clone(), request)
+            .await
+            .expect_err("upstream call should respect read timeout");
+
+        match error {
+            ProxyError::UpstreamRequest { source } => {
+                assert!(source.is_timeout(), "unexpected error: {source:?}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let _ = shutdown.send(());
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
 use url::Url;
@@ -27,6 +28,12 @@ pub struct RouteTarget {
     /// Endpoint of the upstream target. The placeholder is a bare string until
     /// connection pooling and TLS configuration are implemented.
     pub upstream: String,
+    /// Optional timeout applied when establishing new upstream connections.
+    pub connect_timeout: Option<Duration>,
+    /// Optional timeout applied while waiting for upstream responses.
+    pub read_timeout: Option<Duration>,
+    /// Optional timeout applied to the full upstream request lifecycle.
+    pub request_timeout: Option<Duration>,
     /// When true certificate validation will be skipped for the upstream
     /// request. This should only be enabled for local development.
     pub tls_insecure_skip_verify: bool,
@@ -168,6 +175,9 @@ mod tests {
             "route-a".into(),
             RouteTarget {
                 upstream: "https://example.com".into(),
+                connect_timeout: None,
+                read_timeout: None,
+                request_timeout: None,
                 tls_insecure_skip_verify: false,
                 socks5: None,
                 hls: None,
