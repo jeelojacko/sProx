@@ -96,6 +96,36 @@ pub type SharedRoutingTable = Arc<RwLock<RoutingTable>>;
 /// Shared handle to the secret store protected by an asynchronous lock.
 pub type SharedSecretsStore = Arc<RwLock<SecretsStore>>;
 
+/// Configuration applied to the inbound request rate limiter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RateLimitConfig {
+    /// Maximum number of requests that can be processed during each refill
+    /// interval.
+    pub capacity: u64,
+    /// Interval after which a full set of tokens is made available.
+    pub refill_interval: Duration,
+}
+
+impl RateLimitConfig {
+    /// Creates a new [`RateLimitConfig`] with the provided capacity and refill
+    /// interval.
+    pub fn new(capacity: u64, refill_interval: Duration) -> Self {
+        Self {
+            capacity,
+            refill_interval,
+        }
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            capacity: 100,
+            refill_interval: Duration::from_secs(1),
+        }
+    }
+}
+
 /// Top-level application state shared across the Axum router and background
 /// workers.
 #[derive(Clone, Debug)]
@@ -103,6 +133,7 @@ pub struct AppState {
     clients_cache: SharedClientsCache,
     routing_table: SharedRoutingTable,
     secrets: SharedSecretsStore,
+    rate_limit: RateLimitConfig,
 }
 
 impl AppState {
@@ -123,6 +154,7 @@ impl AppState {
             clients_cache,
             routing_table,
             secrets,
+            rate_limit: RateLimitConfig::default(),
         }
     }
 
@@ -140,6 +172,17 @@ impl AppState {
     pub fn secrets(&self) -> SharedSecretsStore {
         Arc::clone(&self.secrets)
     }
+
+    /// Returns the configured rate limit settings.
+    pub fn rate_limit_config(&self) -> RateLimitConfig {
+        self.rate_limit.clone()
+    }
+
+    /// Applies a custom rate limit configuration to the state.
+    pub fn with_rate_limit_config(mut self, rate_limit: RateLimitConfig) -> Self {
+        self.rate_limit = rate_limit;
+        self
+    }
 }
 
 impl Default for AppState {
@@ -148,6 +191,7 @@ impl Default for AppState {
             clients_cache: Arc::new(RwLock::new(HashMap::new())),
             routing_table: Arc::new(RwLock::new(HashMap::new())),
             secrets: Arc::new(RwLock::new(HashMap::new())),
+            rate_limit: RateLimitConfig::default(),
         }
     }
 }
@@ -198,5 +242,13 @@ mod tests {
         let secrets_handle = state.secrets();
         let secrets = secrets_handle.read().await;
         assert_eq!(secrets["api_key"].value, "super-secret");
+    }
+
+    #[test]
+    fn app_state_allows_custom_rate_limit_configuration() {
+        let config = RateLimitConfig::new(5, Duration::from_millis(250));
+        let state = AppState::new().with_rate_limit_config(config.clone());
+
+        assert_eq!(state.rate_limit_config(), config);
     }
 }

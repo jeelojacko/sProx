@@ -16,6 +16,7 @@ use axum::{
 
 use std::{
     convert::Infallible,
+    future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
@@ -30,9 +31,11 @@ use tracing::Level;
 
 use crate::{
     proxy::{self, ProxyError},
-    state::AppState,
+    state::{AppState, RateLimitConfig},
     stream::dash,
 };
+use futures::future::BoxFuture;
+use tower::limit::rate::{RateLimit, RateLimitLayer as TowerRateLimitLayer};
 #[cfg(feature = "telemetry")]
 use tracing::error;
 
@@ -44,6 +47,8 @@ use tracing::error;
 /// tracing and rate limiting, are already attached so that the surrounding
 /// wiring can be validated ahead of time.
 pub fn build_router(state: AppState) -> Router {
+    let rate_limit_layer = RateLimitLayer::new(state.rate_limit_config());
+
     let router = Router::new()
         .route("/health", get(health_check))
         .route("/ip", get(report_client_ip))
@@ -52,7 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/keys/clearkey", get(dash::clearkey_jwks))
         .fallback(proxy_fallback)
         .with_state(state)
-        .layer(RateLimitLayer);
+        .layer(rate_limit_layer);
 
     #[cfg(feature = "telemetry")]
     let router = router.route("/metrics", get(prometheus_metrics));
@@ -369,13 +374,102 @@ fn record_http_metrics(route: &str, status: StatusCode, latency: std::time::Dura
 
 /// Placeholder layer representing the future rate-limiting middleware.
 #[derive(Clone, Default)]
-struct RateLimitLayer;
+struct RateLimitLayer {
+    config: RateLimitConfig,
+}
 
-impl<S> tower::Layer<S> for RateLimitLayer {
-    type Service = S;
+impl RateLimitLayer {
+    fn new(config: RateLimitConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl<S> tower::Layer<S> for RateLimitLayer
+where
+    S: Send + 'static,
+    RateLimit<S>: Send,
+{
+    type Service = SharedRateLimitService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        service
+        let limited = TowerRateLimitLayer::new(self.config.capacity, self.config.refill_interval)
+            .layer(service);
+
+        SharedRateLimitService::new(limited)
+    }
+}
+
+struct SharedRateLimitService<S> {
+    inner: std::sync::Arc<tokio::sync::Mutex<RateLimit<S>>>,
+    lock: Option<BoxFuture<'static, tokio::sync::OwnedMutexGuard<RateLimit<S>>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<RateLimit<S>>>,
+}
+
+impl<S> SharedRateLimitService<S> {
+    fn new(inner: RateLimit<S>) -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(inner)),
+            lock: None,
+            guard: None,
+        }
+    }
+}
+
+impl<S> Clone for SharedRateLimitService<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Arc::clone(&self.inner),
+            lock: None,
+            guard: None,
+        }
+    }
+}
+
+impl<S, Request> tower::Service<Request> for SharedRateLimitService<S>
+where
+    RateLimit<S>: tower::Service<Request> + Send,
+    S: Send + 'static,
+    Request: Send + 'static,
+{
+    type Response = <RateLimit<S> as tower::Service<Request>>::Response;
+    type Error = <RateLimit<S> as tower::Service<Request>>::Error;
+    type Future = <RateLimit<S> as tower::Service<Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        if self.guard.is_none() {
+            if self.lock.is_none() {
+                self.lock = Some(Box::pin(self.inner.clone().lock_owned()));
+            }
+
+            if let Some(fut) = &mut self.lock {
+                match std::pin::Pin::new(fut).poll(cx) {
+                    std::task::Poll::Ready(guard) => {
+                        self.guard = Some(guard);
+                        self.lock = None;
+                    }
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                }
+            }
+        }
+
+        if let Some(guard) = self.guard.as_mut() {
+            tower::Service::poll_ready(&mut **guard, cx)
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        let mut guard = self
+            .guard
+            .take()
+            .expect("poll_ready must be called before call");
+        let future = tower::Service::call(&mut *guard, request);
+        drop(guard);
+        future
     }
 }
 
@@ -386,6 +480,11 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Request};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use tokio::time::sleep;
+    use tower::util::service_fn;
+    use tower::Layer;
+    use tower::Service;
     use tower::ServiceExt; // for `oneshot`
     use tracing::subscriber::with_default;
     use tracing_subscriber::fmt::MakeWriter;
@@ -458,6 +557,68 @@ mod tests {
 
         let body = to_bytes(body, usize::MAX).await.unwrap();
         assert_eq!(body.as_ref(), b"203.0.113.8");
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_throttles_rapid_requests() {
+        let layer = RateLimitLayer::new(RateLimitConfig::new(1, Duration::from_millis(200)));
+        let mut service = layer.layer(service_fn(|_: Request<Body>| async move {
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        }));
+
+        service
+            .ready()
+            .await
+            .expect("service should be ready")
+            .call(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("request should succeed");
+
+        let start = Instant::now();
+        service
+            .ready()
+            .await
+            .expect("service should become ready after waiting")
+            .call(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("request should succeed");
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(180),
+            "second request should be throttled"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_refills_tokens_after_interval() {
+        let layer = RateLimitLayer::new(RateLimitConfig::new(1, Duration::from_millis(120)));
+        let mut service = layer.layer(service_fn(|_: Request<Body>| async move {
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        }));
+
+        service
+            .ready()
+            .await
+            .expect("service should be ready")
+            .call(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("request should succeed");
+
+        sleep(Duration::from_millis(140)).await;
+
+        let start = Instant::now();
+        service
+            .ready()
+            .await
+            .expect("service should be ready after refill")
+            .call(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .expect("request should succeed");
+
+        assert!(
+            start.elapsed() < Duration::from_millis(80),
+            "tokens should be available after refill interval"
+        );
     }
 
     #[tokio::test]
