@@ -22,6 +22,8 @@ routes:
       socks5:
         enabled: false           # Route outbound requests through a SOCKS5 proxy when true.
         address: "127.0.0.1:1080" # SOCKS5 proxy endpoint in host:port format.
+                                  # When the SPROX_PROXY_URL environment variable is set it overrides
+                                  # this address for every route at runtime.
         username: null           # Optional username for authenticated proxies.
         password: null           # Optional password for authenticated proxies.
     hls:
@@ -49,6 +51,7 @@ routes:
       socks5:
         enabled: false
         address: null
+                                # Environment variable overrides apply globally when SPROX_PROXY_URL is set.
         username: null
         password: null
     hls:

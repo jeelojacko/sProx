@@ -80,11 +80,15 @@ Key configuration concepts:
 - **Listeners** – Control the transport protocol (HTTP/1.1, HTTP/2, QUIC), TLS settings
   for inbound traffic, and concurrency limits (to be implemented).
 - **Upstreams** – Describe where traffic is proxied, including TLS requirements,
-  optional SOCKS5 tunnelling, and retry budgets.
+  optional SOCKS5 tunnelling, and retry budgets. Setting the `SPROX_PROXY_URL`
+  environment variable at runtime forces every route to tunnel through the
+  provided SOCKS5 endpoint regardless of the per-route configuration.
 - **Streaming toggles** – Enable playlist rewriting, segment URL translation, DRM key
   acquisition, and future transcoding jobs.
 - **Environment overrides** – Sensitive values (API tokens, TLS private keys) are loaded
-  from environment variables. See `.env.example` for supported overrides.
+  from environment variables. See `.env.example` for supported overrides. When
+  `SPROX_PROXY_URL` is set it supersedes any SOCKS5 addresses defined in
+  `config/routes.yaml`, ensuring a consistent proxy endpoint across all routes.
 
 Each configuration file is validated during start-up. Failing validation should prevent
 the service from booting, which protects against partial rollouts with inconsistent
