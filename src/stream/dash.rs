@@ -360,6 +360,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::fmt::Write;
     use tower::ServiceExt;
 
     use crate::state::{AppState, SecretValue};
@@ -464,18 +465,18 @@ mod tests {
 
         let decoded_16 = decode_key_material(hex_16, key_name).expect("hex16 should decode");
         assert_eq!(decoded_16.len(), 16);
-        let encoded_16: String = decoded_16
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect();
+        let mut encoded_16 = String::with_capacity(decoded_16.len() * 2);
+        for byte in &decoded_16 {
+            write!(&mut encoded_16, "{:02x}", byte).expect("formatting hex");
+        }
         assert_eq!(encoded_16, hex_16);
 
         let decoded_32 = decode_key_material(hex_32, key_name).expect("hex32 should decode");
         assert_eq!(decoded_32.len(), 32);
-        let encoded_32: String = decoded_32
-            .iter()
-            .map(|byte| format!("{:02x}", byte))
-            .collect();
+        let mut encoded_32 = String::with_capacity(decoded_32.len() * 2);
+        for byte in &decoded_32 {
+            write!(&mut encoded_32, "{:02x}", byte).expect("formatting hex");
+        }
         assert_eq!(encoded_32, hex_32);
     }
 }
