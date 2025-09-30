@@ -218,14 +218,64 @@ pub async fn forward(
 }
 
 fn extract_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
-    if let Some(host) = uri.host() {
-        return Some(host.to_string());
+    if let Some(authority) = uri.authority() {
+        if let Some(host) = normalize_host(authority.host()) {
+            return Some(host);
+        }
+    } else if let Some(host) = uri.host() {
+        if let Some(host) = normalize_host(host) {
+            return Some(host);
+        }
     }
 
     headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .map(|value| value.to_string())
+        .and_then(parse_authority_host)
+}
+
+fn parse_authority_host(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(authority) = trimmed.parse::<http::uri::Authority>() {
+        return normalize_host(authority.host());
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix('[') {
+        if let Some(end) = stripped.find(']') {
+            let host = &stripped[..end];
+            return normalize_host(host);
+        }
+    }
+
+    let host = trimmed
+        .split_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(trimmed);
+
+    normalize_host(host)
+}
+
+fn normalize_host(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = trimmed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        if stripped.is_empty() {
+            return None;
+        }
+        return Some(stripped.to_ascii_lowercase());
+    }
+
+    Some(trimmed.to_ascii_lowercase())
 }
 
 fn determine_client_scheme(request: &Request<Body>) -> Option<String> {
@@ -439,6 +489,38 @@ mod tests {
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
+
+    #[test]
+    fn extract_host_from_uri_with_port() {
+        let uri: Uri = "https://Example.COM:8443/stream".parse().unwrap();
+        let headers = HeaderMap::new();
+
+        let host = extract_host(&uri, &headers).expect("host should be extracted");
+
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_from_header_with_port() {
+        let uri: Uri = "/stream".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("Example.COM:8080"));
+
+        let host = extract_host(&uri, &headers).expect("host should be extracted");
+
+        assert_eq!(host, "example.com");
+    }
+
+    #[test]
+    fn extract_host_from_ipv6_header() {
+        let uri: Uri = "/stream".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(HOST, HeaderValue::from_static("[2001:db8::1]:443"));
+
+        let host = extract_host(&uri, &headers).expect("host should be extracted");
+
+        assert_eq!(host, "2001:db8::1");
+    }
 
     #[test]
     fn build_upstream_url_joins_paths() {
