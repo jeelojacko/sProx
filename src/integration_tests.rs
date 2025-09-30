@@ -1,9 +1,21 @@
 use super::*;
 
-use std::{env, time::Duration};
+use std::{collections::HashMap, env, io, net::SocketAddr, sync::Arc, time::Duration};
 
+use axum::{
+    body::Body as AxumBody,
+    extract::State as AxumState,
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode as AxumStatusCode},
+    response::Response as AxumResponse,
+    routing::get,
+    Router,
+};
 use reqwest::StatusCode;
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::{
+    net::TcpListener,
+    sync::{oneshot, Mutex},
+    task::JoinHandle,
+};
 use url::Url;
 
 use sProx::config::{Config, ListenerConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig};
@@ -133,4 +145,295 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
     }
 
     env::remove_var("SPROX_PROXY_URL");
+}
+
+#[tokio::test]
+async fn proxy_stream_returns_full_body_and_injects_accept_ranges() {
+    let body = b"0123456789abcdef".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+    let upstream_log = context.upstream_log();
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes, body);
+
+    assert_eq!(
+        headers
+            .get("accept-ranges")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .expect("content length should be set");
+    assert_eq!(content_length, body.len().to_string());
+    assert!(headers.get("x-unwanted").is_none());
+
+    let requests = upstream_log
+        .lock()
+        .await
+        .iter()
+        .map(|entry| entry.method.clone())
+        .collect::<Vec<_>>();
+    assert!(requests.contains(&Method::HEAD));
+    assert!(requests.contains(&Method::GET));
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_stream_respects_range_and_header_overrides() {
+    let body = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+    let upstream_log = context.upstream_log();
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()))
+        .append_pair("h_referer", "https://player.example.com/watch");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .header("range", "bytes=5-9")
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes, body[5..=9]);
+
+    assert_eq!(
+        headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 5-9/26")
+    );
+    assert_eq!(
+        headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("5")
+    );
+
+    let requests = upstream_log.lock().await.clone();
+    let get_request = requests
+        .into_iter()
+        .rev()
+        .find(|entry| entry.method == Method::GET)
+        .expect("upstream should record GET");
+
+    let header_map = get_request.headers.into_iter().collect::<HashMap<_, _>>();
+    assert_eq!(
+        header_map.get("range").map(String::as_str),
+        Some("bytes=5-9")
+    );
+    assert_eq!(
+        header_map.get("referer").map(String::as_str),
+        Some("https://player.example.com/watch")
+    );
+
+    context.shutdown().await;
+}
+
+struct StreamTestContext {
+    app_addr: SocketAddr,
+    upstream_addr: SocketAddr,
+    upstream_log: Arc<Mutex<Vec<RecordedRequest>>>,
+    app_shutdown: Option<oneshot::Sender<()>>,
+    upstream_shutdown: Option<oneshot::Sender<()>>,
+    app_handle: JoinHandle<Result<(), io::Error>>,
+    upstream_handle: JoinHandle<Result<(), io::Error>>,
+}
+
+impl StreamTestContext {
+    fn app_addr(&self) -> SocketAddr {
+        self.app_addr
+    }
+
+    fn upstream_addr(&self) -> SocketAddr {
+        self.upstream_addr
+    }
+
+    fn upstream_log(&self) -> Arc<Mutex<Vec<RecordedRequest>>> {
+        Arc::clone(&self.upstream_log)
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.app_shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.upstream_shutdown.take() {
+            let _ = tx.send(());
+        }
+
+        let _ = self.app_handle.await;
+        let _ = self.upstream_handle.await;
+    }
+}
+
+async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
+    let upstream_state = UpstreamState::new(body);
+    let upstream_log = upstream_state.log.clone();
+    let upstream_router = Router::new()
+        .route("/asset", get(upstream_handler).head(upstream_handler))
+        .with_state(upstream_state);
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream should expose local address");
+    let (upstream_shutdown, upstream_rx) = oneshot::channel();
+    let upstream_handle = tokio::spawn(async move {
+        axum::serve(upstream_listener, upstream_router)
+            .with_graceful_shutdown(async {
+                let _ = upstream_rx.await;
+            })
+            .await
+    });
+
+    let app_state = AppState::new();
+    let router = app::build_router(app_state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proxy should bind");
+    let app_addr = listener
+        .local_addr()
+        .expect("proxy should expose local address");
+    let (app_shutdown, app_rx) = oneshot::channel();
+    let app_handle = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async {
+                let _ = app_rx.await;
+            })
+            .await
+    });
+
+    StreamTestContext {
+        app_addr,
+        upstream_addr,
+        upstream_log,
+        app_shutdown: Some(app_shutdown),
+        upstream_shutdown: Some(upstream_shutdown),
+        app_handle,
+        upstream_handle,
+    }
+}
+
+#[derive(Clone)]
+struct UpstreamState {
+    body: Arc<Vec<u8>>,
+    log: Arc<Mutex<Vec<RecordedRequest>>>,
+}
+
+impl UpstreamState {
+    fn new(body: Vec<u8>) -> Self {
+        Self {
+            body: Arc::new(body),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    method: Method,
+    headers: Vec<(String, String)>,
+}
+
+async fn upstream_handler(
+    AxumState(state): AxumState<UpstreamState>,
+    method: Method,
+    headers: HeaderMap,
+) -> AxumResponse {
+    let mut recorded_headers = Vec::new();
+    for (name, value) in headers.iter() {
+        if let Ok(value) = value.to_str() {
+            recorded_headers.push((name.as_str().to_string(), value.to_string()));
+        }
+    }
+    state.log.lock().await.push(RecordedRequest {
+        method: method.clone(),
+        headers: recorded_headers,
+    });
+
+    let full = state.body.clone();
+    let total_len = full.len() as u64;
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_range_header);
+
+    let (status, slice, length, range_metadata) = if let Some((start, end)) = range {
+        let end = end.min(full.len().saturating_sub(1));
+        let start = start.min(end);
+        let length = end - start + 1;
+        (
+            AxumStatusCode::PARTIAL_CONTENT,
+            full[start..=end].to_vec(),
+            length,
+            Some((start as u64, end as u64, total_len)),
+        )
+    } else {
+        (AxumStatusCode::OK, full.to_vec(), full.len(), None)
+    };
+
+    let mut builder = AxumResponse::builder().status(status);
+    builder = builder.header(header::CONTENT_TYPE, "video/mp4");
+    builder = builder.header(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&length.to_string()).expect("valid content length"),
+    );
+    builder = builder.header(header::ETAG, "test-etag");
+    builder = builder.header("x-unwanted", "true");
+
+    if let Some((start, end, total)) = range_metadata {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+    }
+
+    if method == Method::HEAD {
+        builder
+            .body(AxumBody::empty())
+            .expect("head response should build")
+    } else {
+        builder
+            .body(AxumBody::from(slice))
+            .expect("get response should build")
+    }
+}
+
+fn parse_range_header(value: &str) -> Option<(usize, usize)> {
+    let value = value.strip_prefix("bytes=")?;
+    let mut parts = value.splitn(2, '-');
+    let start = parts.next()?.parse().ok()?;
+    let end = parts.next()?.parse().ok()?;
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
 }

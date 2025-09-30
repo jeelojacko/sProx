@@ -131,6 +131,31 @@ Further operational playbooks (disaster recovery, observability, canary rollouts
 added as the implementation matures. For interim guidance consult
 [`docs/operational-notes.md`](docs/operational-notes.md).
 
+## Proxy endpoints
+
+### `/proxy/stream`
+
+The `/proxy/stream` endpoint performs a direct byte-range proxy against an arbitrary
+upstream URL. Downstream callers provide the upstream location via the mandatory `d`
+query parameter and may optionally override a curated set of request headers by prefixing
+them with `h_`. Underscores in override keys are converted to hyphens before being sent
+upstream. For example:
+
+```http
+GET /proxy/stream?d=https%3A%2F%2Forigin.local%2Fassets%2Fmovie.mp4&h_referer=https%3A%2F%2Fplayer.example.com HTTP/1.1
+Host: sprox.local
+Range: bytes=0-1048575
+```
+
+Only an allowlisted subset of headers (such as `Range`, `Referer`, `User-Agent`, and
+conditional request headers) are forwarded upstream. Responses stream the upstream body
+directly to the caller while copying a small set of safe headers (`Content-Type`,
+`Content-Length`, `Content-Range`, caching metadata, etc.). If the upstream does not
+advertise byte range support the proxy injects `Accept-Ranges: bytes` to maintain
+playback compatibility. Standard HTTP range semantics apply: a successful partial request
+returns `206 Partial Content` with the appropriate `Content-Range`, while full responses
+return `200 OK` alongside the upstream `Content-Length`.
+
 ## Local development
 
 1. **Install prerequisites**

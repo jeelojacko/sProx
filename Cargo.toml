@@ -17,6 +17,7 @@ http-proxy = [
     "dep:tower",
     "dep:hyper",
     "dep:reqwest",
+    "dep:serde",
 ]
 
 # Enable configuration serialization/deserialization helpers.
