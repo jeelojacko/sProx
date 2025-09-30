@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use sProx::{
     app,
     config::{Config, ListenerConfig},
+    routing::{PortRange, RouteDefinition, RoutingEngine},
     state::{AppState, HlsOptions, RouteTarget, Socks5Proxy},
 };
 use tokio::{net::TcpListener, sync::RwLock};
@@ -30,7 +31,8 @@ async fn main() -> Result<()> {
     let addr = resolve_listener_addr(listener)
         .context("failed to resolve listener address from configuration")?;
 
-    let state = build_app_state(&config);
+    let state =
+        build_app_state(&config).context("failed to build application state from configuration")?;
     let router = app::build_router(state);
 
     tracing::info!(path = %config_path, %addr, "starting sProx server");
@@ -53,8 +55,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_app_state(config: &Config) -> AppState {
+fn build_app_state(config: &Config) -> Result<AppState> {
     let mut routing_table = HashMap::new();
+    let mut route_definitions = Vec::with_capacity(config.routes.len());
 
     for route in &config.routes {
         let socks5 = if route.upstream.socks5.enabled {
@@ -90,13 +93,24 @@ fn build_app_state(config: &Config) -> AppState {
         };
 
         routing_table.insert(route.id.clone(), target);
+
+        let port_range = PortRange::new(route.listen.port, route.listen.port)?;
+        route_definitions.push(RouteDefinition {
+            id: route.id.clone(),
+            host_patterns: Vec::new(),
+            protocols: Vec::new(),
+            ports: vec![port_range],
+        });
     }
 
-    AppState::with_components(
+    let routing_engine = Arc::new(RoutingEngine::new(route_definitions)?);
+
+    Ok(AppState::with_components(
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(RwLock::new(routing_table)),
         Arc::new(RwLock::new(HashMap::new())),
-    )
+        routing_engine,
+    ))
 }
 
 fn primary_listener(config: &Config) -> Option<&ListenerConfig> {

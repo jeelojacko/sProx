@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use url::Url;
 
+use crate::routing::RoutingEngine;
+
 /// Identifier used to look up cached client metadata.
 pub type ClientId = String;
 
@@ -96,6 +98,9 @@ pub type SharedRoutingTable = Arc<RwLock<RoutingTable>>;
 /// Shared handle to the secret store protected by an asynchronous lock.
 pub type SharedSecretsStore = Arc<RwLock<SecretsStore>>;
 
+/// Shared handle to the compiled routing engine used when selecting routes.
+pub type SharedRoutingEngine = Arc<RoutingEngine>;
+
 /// Configuration applied to the inbound request rate limiter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateLimitConfig {
@@ -134,6 +139,7 @@ pub struct AppState {
     routing_table: SharedRoutingTable,
     secrets: SharedSecretsStore,
     rate_limit: RateLimitConfig,
+    routing_engine: SharedRoutingEngine,
 }
 
 impl AppState {
@@ -149,12 +155,14 @@ impl AppState {
         clients_cache: SharedClientsCache,
         routing_table: SharedRoutingTable,
         secrets: SharedSecretsStore,
+        routing_engine: SharedRoutingEngine,
     ) -> Self {
         Self {
             clients_cache,
             routing_table,
             secrets,
             rate_limit: RateLimitConfig::default(),
+            routing_engine,
         }
     }
 
@@ -173,6 +181,11 @@ impl AppState {
         Arc::clone(&self.secrets)
     }
 
+    /// Returns a clone of the compiled routing engine handle.
+    pub fn routing_engine(&self) -> SharedRoutingEngine {
+        Arc::clone(&self.routing_engine)
+    }
+
     /// Returns the configured rate limit settings.
     pub fn rate_limit_config(&self) -> RateLimitConfig {
         self.rate_limit.clone()
@@ -181,6 +194,12 @@ impl AppState {
     /// Applies a custom rate limit configuration to the state.
     pub fn with_rate_limit_config(mut self, rate_limit: RateLimitConfig) -> Self {
         self.rate_limit = rate_limit;
+        self
+    }
+
+    /// Replaces the routing engine backing the state with the provided instance.
+    pub fn with_routing_engine(mut self, routing_engine: SharedRoutingEngine) -> Self {
+        self.routing_engine = routing_engine;
         self
     }
 }
@@ -192,6 +211,10 @@ impl Default for AppState {
             routing_table: Arc::new(RwLock::new(HashMap::new())),
             secrets: Arc::new(RwLock::new(HashMap::new())),
             rate_limit: RateLimitConfig::default(),
+            routing_engine: Arc::new(
+                RoutingEngine::new(Vec::new())
+                    .expect("routing engine should compile for empty routes"),
+            ),
         }
     }
 }
