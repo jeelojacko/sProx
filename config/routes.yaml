@@ -8,8 +8,6 @@ routes:
     host_patterns:
       - "vod-edge.example.com"
       - "*.vod.example.com"
-    protocols:
-      - https
     upstream:
       origin: "https://origin.example.com/vod"
       connect_timeout_ms: 2000
