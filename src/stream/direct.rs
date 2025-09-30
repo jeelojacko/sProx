@@ -355,16 +355,22 @@ impl DirectStreamService {
         url: Url,
         headers: ReqwestHeaderMap,
     ) -> Result<Response<Body>, DirectStreamError> {
-        let head_response = self
+        let head_status = self
             .client
             .head(url.clone())
             .headers(headers.clone())
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
+            .map_err(|source| DirectStreamError::UpstreamRequest { source })?
+            .status();
 
-        validate_upstream_status(head_response.status())?;
+        if !matches!(
+            head_status,
+            reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_IMPLEMENTED
+        ) {
+            validate_upstream_status(head_status)?;
+        }
 
         let get_response = self
             .client
