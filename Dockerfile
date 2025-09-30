@@ -16,16 +16,24 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
 
+ARG TARGETARCH
 ARG SHAKA_PACKAGER_VERSION=v2.6.1
-ARG SHAKA_PACKAGER_SHA256=328317e8f12dbcf9a5a172704699c2da51e54feb68cec5787666c2ab07b2c88d
+ARG SHAKA_PACKAGER_SHA256_AMD64=328317e8f12dbcf9a5a172704699c2da51e54feb68cec5787666c2ab07b2c88d
+ARG SHAKA_PACKAGER_SHA256_ARM64=ebeed27e7c1546ca85c08effd45ef2a95b64255228385526868194dcfea0750d
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
-    && curl -fsSL "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_PACKAGER_VERSION}/packager-linux-x64" -o /usr/local/bin/packager \
-    && echo "${SHAKA_PACKAGER_SHA256}  /usr/local/bin/packager" | sha256sum -c - \
-    && chmod +x /usr/local/bin/packager \
-    && ln -s /usr/local/bin/packager /usr/local/bin/shaka-packager \
-    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) shaka_packager_asset="packager-linux-x64"; shaka_packager_sha="${SHAKA_PACKAGER_SHA256_AMD64}" ;; \
+        arm64) shaka_packager_asset="packager-linux-arm64"; shaka_packager_sha="${SHAKA_PACKAGER_SHA256_ARM64}" ;; \
+        *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl ffmpeg; \
+    curl -fsSL "https://github.com/shaka-project/shaka-packager/releases/download/${SHAKA_PACKAGER_VERSION}/${shaka_packager_asset}" -o /usr/local/bin/packager; \
+    echo "${shaka_packager_sha}  /usr/local/bin/packager" | sha256sum -c -; \
+    chmod +x /usr/local/bin/packager; \
+    ln -s /usr/local/bin/packager /usr/local/bin/shaka-packager; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /app/target/release/sProx /usr/local/bin/sprox

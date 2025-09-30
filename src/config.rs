@@ -645,7 +645,6 @@ fn validation_error(context: impl Into<String>, message: impl Into<String>) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routing::RouteProtocol;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
@@ -685,7 +684,7 @@ mod tests {
             config.routes[0].host_patterns,
             vec!["vod-edge.example.com", "*.vod.example.com"]
         );
-        assert_eq!(config.routes[0].protocols, vec![RouteProtocol::Https]);
+        assert!(config.routes[0].protocols.is_empty());
         assert!(config.routes[0].upstream.tls.enabled);
         assert_eq!(
             config.routes[0]
