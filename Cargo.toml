@@ -31,6 +31,8 @@ telemetry = [
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:tower-http",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
 ]
 
 # Feature flag placeholders for upcoming media tooling.
@@ -60,7 +62,9 @@ tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "
 tower = { version = "0.4", features = ["util"], optional = true }
 tower-http = { version = "0.5", features = ["trace"], optional = true }
 tracing = { version = "0.1", features = ["std"], optional = true }
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"], optional = true }
+metrics = { version = "0.22", optional = true }
+metrics-exporter-prometheus = { version = "0.13", default-features = false, optional = true }
 url = "=2.4.1"
 dotenvy = "0.15"
 sha2 = "0.10"

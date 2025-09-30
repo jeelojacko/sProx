@@ -252,7 +252,8 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         format!("{context}.upstream.read_timeout_ms"),
     )?;
 
-    let tls = parse_tls(raw.tls);
+    let tls_context = format!("{context}.upstream.tls");
+    let tls = parse_tls(raw.tls, &tls_context);
     let socks5 = parse_socks5(raw.socks5, context)?;
 
     Ok(UpstreamConfig {
@@ -264,11 +265,19 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
     })
 }
 
-fn parse_tls(raw: RawTls) -> TlsConfig {
+fn parse_tls(raw: RawTls, context: &str) -> TlsConfig {
     let sni_hostname = raw
         .sni_hostname
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+
+    if raw.enabled && raw.insecure_skip_verify {
+        #[cfg(feature = "telemetry")]
+        tracing::warn!(
+            context = %context,
+            "TLS insecure_skip_verify is enabled; upstream certificates will not be validated.",
+        );
+    }
 
     TlsConfig {
         enabled: raw.enabled,
@@ -332,6 +341,14 @@ fn parse_hls(raw: RawHls, context: &str) -> Result<HlsConfig, ConfigError> {
             format!("{context}.hls.base_url"),
             "base_url must be provided when rewrite_playlist_urls is true",
         ));
+    }
+
+    if raw.allow_insecure_segments {
+        #[cfg(feature = "telemetry")]
+        tracing::warn!(
+            context = %context,
+            "allow_insecure_segments is enabled; rewritten manifests may emit http:// URLs.",
+        );
     }
 
     Ok(HlsConfig {

@@ -16,14 +16,22 @@ pub mod routing;
 pub mod security;
 pub mod state;
 pub mod stream;
+#[cfg(feature = "telemetry")]
+mod telemetry;
 pub mod util;
 
-/// Initializes crate-level resources. The implementation will be
-/// provided in later steps once configuration loading and telemetry are
-/// available.
-pub fn init_placeholder() {
-    // Intentionally left empty until future tasks add initialization
-    // logic.
+/// Initializes crate-level resources, including telemetry stacks when the
+/// corresponding features are enabled.
+pub fn init() -> anyhow::Result<()> {
+    #[cfg(feature = "telemetry")]
+    telemetry::init()?;
+
+    Ok(())
+}
+
+#[cfg(feature = "telemetry")]
+pub fn scrape_metrics() -> Option<String> {
+    telemetry::prometheus_metrics()
 }
 
 #[cfg(test)]
@@ -31,7 +39,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_placeholder_does_not_panic() {
-        init_placeholder();
+    fn init_does_not_error() {
+        init().expect("initialization should succeed");
     }
 }
