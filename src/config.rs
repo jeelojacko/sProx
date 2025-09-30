@@ -28,8 +28,9 @@ pub struct ListenerConfig {
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub origin: Url,
-    pub connect_timeout: Duration,
-    pub read_timeout: Duration,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub request_timeout: Option<Duration>,
     pub tls: TlsConfig,
     pub socks5: Socks5Config,
 }
@@ -124,8 +125,12 @@ struct RawListener {
 #[derive(Debug, Deserialize)]
 struct RawUpstream {
     origin: String,
-    connect_timeout_ms: u64,
-    read_timeout_ms: u64,
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    read_timeout_ms: Option<u64>,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
     #[serde(default)]
     tls: RawTls,
     #[serde(default)]
@@ -243,13 +248,17 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         )
     })?;
 
-    let connect_timeout = duration_from_millis(
+    let connect_timeout = optional_duration_from_millis(
         raw.connect_timeout_ms,
         format!("{context}.upstream.connect_timeout_ms"),
     )?;
-    let read_timeout = duration_from_millis(
+    let read_timeout = optional_duration_from_millis(
         raw.read_timeout_ms,
         format!("{context}.upstream.read_timeout_ms"),
+    )?;
+    let request_timeout = optional_duration_from_millis(
+        raw.request_timeout_ms,
+        format!("{context}.upstream.request_timeout_ms"),
     )?;
 
     let tls_context = format!("{context}.upstream.tls");
@@ -260,6 +269,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         origin,
         connect_timeout,
         read_timeout,
+        request_timeout,
         tls,
         socks5,
     })
@@ -359,6 +369,16 @@ fn parse_hls(raw: RawHls, context: &str) -> Result<HlsConfig, ConfigError> {
     })
 }
 
+fn optional_duration_from_millis(
+    value: Option<u64>,
+    context: String,
+) -> Result<Option<Duration>, ConfigError> {
+    match value {
+        Some(value) => duration_from_millis(value, context).map(Some),
+        None => Ok(None),
+    }
+}
+
 fn duration_from_millis(value: u64, context: String) -> Result<Duration, ConfigError> {
     if value == 0 {
         return Err(validation_error(
@@ -380,6 +400,7 @@ fn validation_error(context: impl Into<String>, message: impl Into<String>) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn loads_sample_routes_configuration() {
@@ -388,6 +409,27 @@ mod tests {
         assert_eq!(config.routes.len(), 2);
         assert_eq!(config.routes[0].id, "vod-edge");
         assert!(config.routes[0].upstream.tls.enabled);
+        assert_eq!(
+            config.routes[0]
+                .upstream
+                .connect_timeout
+                .expect("connect timeout should be parsed"),
+            Duration::from_millis(2000)
+        );
+        assert_eq!(
+            config.routes[0]
+                .upstream
+                .read_timeout
+                .expect("read timeout should be parsed"),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            config.routes[0]
+                .upstream
+                .request_timeout
+                .expect("request timeout should be parsed"),
+            Duration::from_millis(8000)
+        );
     }
 
     #[test]
@@ -401,8 +443,9 @@ mod tests {
                 },
                 upstream: RawUpstream {
                     origin: "http://example.com".into(),
-                    connect_timeout_ms: 1000,
-                    read_timeout_ms: 1000,
+                    connect_timeout_ms: Some(1000),
+                    read_timeout_ms: Some(1000),
+                    request_timeout_ms: None,
                     tls: RawTls::default(),
                     socks5: RawSocks5::default(),
                 },
