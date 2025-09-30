@@ -6,6 +6,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
+use crate::routing::RouteProtocol;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub routes: Vec<RouteConfig>,
@@ -15,6 +17,8 @@ pub struct Config {
 pub struct RouteConfig {
     pub id: String,
     pub listen: ListenerConfig,
+    pub host_patterns: Vec<String>,
+    pub protocols: Vec<RouteProtocol>,
     pub upstream: UpstreamConfig,
     pub hls: Option<HlsConfig>,
 }
@@ -111,6 +115,10 @@ struct RawConfig {
 struct RawRoute {
     id: String,
     listen: RawListener,
+    #[serde(default)]
+    host_patterns: Vec<String>,
+    #[serde(default)]
+    protocols: Vec<String>,
     upstream: RawUpstream,
     #[serde(default)]
     hls: Option<RawHls>,
@@ -204,6 +212,8 @@ impl RawRoute {
         }
 
         let listen = parse_listener(self.listen, &context)?;
+        let host_patterns = parse_host_patterns(self.host_patterns, &context)?;
+        let protocols = parse_protocols(self.protocols, &context)?;
         let upstream = parse_upstream(self.upstream, &context)?;
         let hls = match self.hls {
             Some(hls) => Some(parse_hls(hls, &context)?),
@@ -213,6 +223,8 @@ impl RawRoute {
         Ok(RouteConfig {
             id: self.id,
             listen,
+            host_patterns,
+            protocols,
             upstream,
             hls,
         })
@@ -273,6 +285,53 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         tls,
         socks5,
     })
+}
+
+fn parse_host_patterns(patterns: Vec<String>, context: &str) -> Result<Vec<String>, ConfigError> {
+    let mut parsed = Vec::with_capacity(patterns.len());
+
+    for (idx, pattern) in patterns.into_iter().enumerate() {
+        let trimmed = pattern.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.host_patterns[{idx}]"),
+                "host pattern must not be empty",
+            ));
+        }
+
+        parsed.push(trimmed.to_ascii_lowercase());
+    }
+
+    Ok(parsed)
+}
+
+fn parse_protocols(
+    protocols: Vec<String>,
+    context: &str,
+) -> Result<Vec<RouteProtocol>, ConfigError> {
+    let mut parsed = Vec::with_capacity(protocols.len());
+
+    for (idx, protocol) in protocols.into_iter().enumerate() {
+        let trimmed = protocol.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.protocols[{idx}]"),
+                "protocol must not be empty",
+            ));
+        }
+
+        let normalized = trimmed.to_ascii_lowercase();
+        let Some(value) = RouteProtocol::from_scheme(&normalized) else {
+            return Err(validation_error(
+                format!("{context}.protocols[{idx}]"),
+                format!("unsupported protocol `{trimmed}`"),
+            ));
+        };
+
+        parsed.push(value);
+    }
+
+    Ok(parsed)
 }
 
 fn parse_tls(raw: RawTls, context: &str) -> TlsConfig {
@@ -400,6 +459,7 @@ fn validation_error(context: impl Into<String>, message: impl Into<String>) -> C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::RouteProtocol;
     use std::time::Duration;
 
     #[test]
@@ -408,6 +468,11 @@ mod tests {
             Config::load_from_path("config/routes.yaml").expect("configuration should load");
         assert_eq!(config.routes.len(), 2);
         assert_eq!(config.routes[0].id, "vod-edge");
+        assert_eq!(
+            config.routes[0].host_patterns,
+            vec!["vod-edge.example.com", "*.vod.example.com"]
+        );
+        assert_eq!(config.routes[0].protocols, vec![RouteProtocol::Https]);
         assert!(config.routes[0].upstream.tls.enabled);
         assert_eq!(
             config.routes[0]
@@ -441,6 +506,8 @@ mod tests {
                     host: "127.0.0.1".into(),
                     port: 8080,
                 },
+                host_patterns: Vec::new(),
+                protocols: Vec::new(),
                 upstream: RawUpstream {
                     origin: "http://example.com".into(),
                     connect_timeout_ms: Some(1000),
