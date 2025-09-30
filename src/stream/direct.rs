@@ -27,7 +27,8 @@ use url::form_urlencoded;
 
 use crate::state::AppState;
 
-const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const DIRECT_STREAM_PASSWORD_HEADER: &str = "x-sprox-api-password";
+const DIRECT_STREAM_PASSWORD_QUERY_KEY: &str = "api_password";
 
 const REQUEST_HEADER_ALLOWLIST: &[&str] = &[
     "accept",
@@ -71,6 +72,12 @@ pub struct DirectStreamQuery {
 enum DirectStreamError {
     #[error("missing destination url")]
     MissingDestination,
+
+    #[error("missing direct stream password")]
+    MissingApiPassword,
+
+    #[error("direct stream password is invalid")]
+    InvalidApiPassword,
 
     #[error("invalid destination url: {source}")]
     InvalidDestination {
@@ -121,13 +128,13 @@ enum DirectStreamError {
     },
 
     #[error("upstream request failed: {source}")]
-    UpstreamRequest {
-        #[from]
-        source: reqwest::Error,
-    },
+    UpstreamRequest { source: reqwest::Error },
 
     #[error("upstream returned status {status}")]
     UpstreamStatus { status: StatusCode },
+
+    #[error("failed to initialize direct stream client: {source}")]
+    ClientBuild { source: reqwest::Error },
 }
 
 impl DirectStreamError {
@@ -169,6 +176,18 @@ impl DirectStreamError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to construct response: {source}"),
             ),
+            Self::MissingApiPassword => (
+                StatusCode::UNAUTHORIZED,
+                "direct stream password is required".to_string(),
+            ),
+            Self::InvalidApiPassword => (
+                StatusCode::FORBIDDEN,
+                "direct stream password is invalid".to_string(),
+            ),
+            Self::ClientBuild { source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to initialize direct stream client: {source}"),
+            ),
             Self::UpstreamRequest { source } => {
                 if source.is_timeout() {
                     (
@@ -200,6 +219,19 @@ pub async fn handle_proxy_stream(
         return Err(DirectStreamError::MissingDestination.into_response());
     }
 
+    if let Some(expected_password) = state.direct_stream_api_password() {
+        let provided_password = extract_api_password(&downstream_headers, &query);
+        match provided_password {
+            Some(value) if value == expected_password => {}
+            Some(_) => {
+                return Err(DirectStreamError::InvalidApiPassword.into_response());
+            }
+            None => {
+                return Err(DirectStreamError::MissingApiPassword.into_response());
+            }
+        }
+    }
+
     let upstream_url = Url::parse(&query.d)
         .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
 
@@ -207,12 +239,23 @@ pub async fn handle_proxy_stream(
     let upstream_headers = prepare_upstream_headers(&downstream_headers, &overrides)
         .map_err(|error| error.into_response())?;
 
-    let service = DirectStreamService::new(state.http_client());
+    let client = state
+        .direct_stream_client()
+        .map_err(|source| DirectStreamError::ClientBuild { source }.into_response())?;
+    let request_timeout = state.direct_stream_request_timeout();
+    let service = DirectStreamService::new(client, request_timeout);
 
     service
         .stream(upstream_url, upstream_headers)
         .await
         .map_err(|error| error.into_response())
+}
+
+fn extract_api_password(headers: &HeaderMap, query: &DirectStreamQuery) -> Option<String> {
+    headers
+        .get(DIRECT_STREAM_PASSWORD_HEADER)
+        .and_then(|value| value.to_str().ok().map(|value| value.to_owned()))
+        .or_else(|| query.extra.get(DIRECT_STREAM_PASSWORD_QUERY_KEY).cloned())
 }
 
 fn extract_header_overrides(uri: &Uri) -> Vec<(String, String)> {
@@ -296,11 +339,15 @@ fn is_response_header_allowed(name: &str) -> bool {
 #[derive(Clone)]
 struct DirectStreamService {
     client: Client,
+    request_timeout: Duration,
 }
 
 impl DirectStreamService {
-    fn new(client: Client) -> Self {
-        Self { client }
+    fn new(client: Client, request_timeout: Duration) -> Self {
+        Self {
+            client,
+            request_timeout,
+        }
     }
 
     async fn stream(
@@ -312,9 +359,10 @@ impl DirectStreamService {
             .client
             .head(url.clone())
             .headers(headers.clone())
-            .timeout(STREAM_REQUEST_TIMEOUT)
+            .timeout(self.request_timeout)
             .send()
-            .await?;
+            .await
+            .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
 
         validate_upstream_status(head_response.status())?;
 
@@ -322,9 +370,10 @@ impl DirectStreamService {
             .client
             .get(url)
             .headers(headers)
-            .timeout(STREAM_REQUEST_TIMEOUT)
+            .timeout(self.request_timeout)
             .send()
-            .await?;
+            .await
+            .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
 
         validate_upstream_status(get_response.status())?;
 

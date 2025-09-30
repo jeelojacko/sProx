@@ -1,3 +1,4 @@
+use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,7 +11,35 @@ use crate::routing::RouteProtocol;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub direct_stream: Option<DirectStreamConfig>,
     pub routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectStreamConfig {
+    pub proxy_url: Option<Url>,
+    pub api_password: Option<String>,
+    pub request_timeout: Duration,
+    pub response_buffer_bytes: usize,
+}
+
+impl DirectStreamConfig {
+    pub const DEFAULT_RESPONSE_BUFFER_BYTES: usize = 65_536;
+
+    pub fn default_request_timeout() -> Duration {
+        Duration::from_secs(30)
+    }
+}
+
+impl Default for DirectStreamConfig {
+    fn default() -> Self {
+        Self {
+            proxy_url: None,
+            api_password: None,
+            request_timeout: Self::default_request_timeout(),
+            response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,7 +137,21 @@ fn map_config_error(path: &Path, error: config_rs::ConfigError) -> ConfigError {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
+    #[serde(default)]
+    direct_stream: Option<RawDirectStream>,
     routes: Vec<RawRoute>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawDirectStream {
+    #[serde(default)]
+    proxy_url: Option<String>,
+    #[serde(default)]
+    api_password: Option<String>,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    response_buffer_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,8 +241,93 @@ impl TryFrom<RawConfig> for Config {
             routes.push(route.try_into_context(context)?);
         }
 
-        Ok(Self { routes })
+        let direct_stream = parse_direct_stream(raw.direct_stream)?;
+
+        Ok(Self {
+            direct_stream,
+            routes,
+        })
     }
+}
+
+fn parse_direct_stream(
+    raw: Option<RawDirectStream>,
+) -> Result<Option<DirectStreamConfig>, ConfigError> {
+    let mut parsed = raw
+        .map(|raw| raw.try_into_config("direct_stream"))
+        .transpose()?;
+
+    let env_proxy = env::var("SPROX_DIRECT_PROXY_URL")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let env_password = env::var("SPROX_DIRECT_API_PASSWORD")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let env_timeout = env::var("SPROX_DIRECT_REQUEST_TIMEOUT_MS")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<u64>().map_err(|err| {
+                validation_error(
+                    "env.SPROX_DIRECT_REQUEST_TIMEOUT_MS",
+                    format!("invalid integer: {err}"),
+                )
+            })
+        })
+        .transpose()?;
+    let env_buffer = env::var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.parse::<usize>().map_err(|err| {
+                validation_error(
+                    "env.SPROX_DIRECT_RESPONSE_BUFFER_BYTES",
+                    format!("invalid integer: {err}"),
+                )
+            })
+        })
+        .transpose()?;
+
+    if env_proxy.is_some()
+        || env_password.is_some()
+        || env_timeout.is_some()
+        || env_buffer.is_some()
+    {
+        let mut effective = parsed.unwrap_or_default();
+
+        if let Some(proxy) = env_proxy {
+            let context = "env.SPROX_DIRECT_PROXY_URL";
+            let parsed_proxy = Url::parse(&proxy)
+                .map_err(|err| validation_error(context, format!("invalid URL: {err}")))?;
+            effective.proxy_url = Some(parsed_proxy);
+        }
+
+        if let Some(password) = env_password {
+            effective.api_password = Some(password);
+        }
+
+        if let Some(timeout_ms) = env_timeout {
+            effective.request_timeout = duration_from_millis(
+                timeout_ms,
+                "env.SPROX_DIRECT_REQUEST_TIMEOUT_MS".to_string(),
+            )?;
+        }
+
+        if let Some(buffer_bytes) = env_buffer {
+            effective.response_buffer_bytes = buffer_size_from_bytes(
+                buffer_bytes,
+                "env.SPROX_DIRECT_RESPONSE_BUFFER_BYTES".to_string(),
+            )?;
+        }
+
+        parsed = Some(effective);
+    }
+
+    Ok(parsed)
 }
 
 impl RawRoute {
@@ -228,6 +356,46 @@ impl RawRoute {
             upstream,
             hls,
         })
+    }
+}
+
+impl RawDirectStream {
+    fn try_into_config(self, context: &str) -> Result<DirectStreamConfig, ConfigError> {
+        let mut config = DirectStreamConfig::default();
+
+        if let Some(proxy_url) = self.proxy_url.and_then(|value| {
+            let trimmed = value.trim().to_owned();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }) {
+            let parsed = Url::parse(&proxy_url).map_err(|err| {
+                validation_error(
+                    format!("{context}.proxy_url"),
+                    format!("invalid URL: {err}"),
+                )
+            })?;
+            config.proxy_url = Some(parsed);
+        }
+
+        config.api_password = self
+            .api_password
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        if let Some(timeout_ms) = self.request_timeout_ms {
+            config.request_timeout =
+                duration_from_millis(timeout_ms, format!("{context}.request_timeout_ms"))?;
+        }
+
+        if let Some(buffer_bytes) = self.response_buffer_bytes {
+            config.response_buffer_bytes =
+                buffer_size_from_bytes(buffer_bytes, format!("{context}.response_buffer_bytes"))?;
+        }
+
+        Ok(config)
     }
 }
 
@@ -449,6 +617,24 @@ fn duration_from_millis(value: u64, context: String) -> Result<Duration, ConfigE
     Ok(Duration::from_millis(value))
 }
 
+fn buffer_size_from_bytes(value: usize, context: String) -> Result<usize, ConfigError> {
+    if value == 0 {
+        return Err(validation_error(
+            context,
+            "buffer size must be greater than zero",
+        ));
+    }
+
+    if value > u32::MAX as usize {
+        return Err(validation_error(
+            context,
+            format!("buffer size must not exceed {}", u32::MAX),
+        ));
+    }
+
+    Ok(value)
+}
+
 fn validation_error(context: impl Into<String>, message: impl Into<String>) -> ConfigError {
     ConfigError::Validation {
         context: context.into(),
@@ -460,7 +646,34 @@ fn validation_error(context: impl Into<String>, message: impl Into<String>) -> C
 mod tests {
     use super::*;
     use crate::routing::RouteProtocol;
+    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn sample_route() -> RawRoute {
+        RawRoute {
+            id: "route".into(),
+            listen: RawListener {
+                host: "127.0.0.1".into(),
+                port: 8080,
+            },
+            host_patterns: Vec::new(),
+            protocols: Vec::new(),
+            upstream: RawUpstream {
+                origin: "http://example.com".into(),
+                connect_timeout_ms: Some(1000),
+                read_timeout_ms: Some(1000),
+                request_timeout_ms: Some(1000),
+                tls: RawTls::default(),
+                socks5: RawSocks5::default(),
+            },
+            hls: None,
+        }
+    }
 
     #[test]
     fn loads_sample_routes_configuration() {
@@ -495,11 +708,26 @@ mod tests {
                 .expect("request timeout should be parsed"),
             Duration::from_millis(8000)
         );
+        let direct = config
+            .direct_stream
+            .as_ref()
+            .expect("direct stream configuration should be present");
+        assert!(direct.proxy_url.is_none());
+        assert!(direct.api_password.is_none());
+        assert_eq!(
+            direct.request_timeout,
+            DirectStreamConfig::default_request_timeout()
+        );
+        assert_eq!(
+            direct.response_buffer_bytes,
+            DirectStreamConfig::DEFAULT_RESPONSE_BUFFER_BYTES
+        );
     }
 
     #[test]
     fn rejects_missing_route_id() {
         let raw = RawConfig {
+            direct_stream: None,
             routes: vec![RawRoute {
                 id: "   ".into(),
                 listen: RawListener {
@@ -527,5 +755,75 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn direct_stream_defaults_to_none_without_overrides() {
+        let raw = RawConfig {
+            direct_stream: None,
+            routes: vec![sample_route()],
+        };
+
+        let config = Config::try_from(raw).expect("configuration should load");
+        assert!(config.direct_stream.is_none());
+    }
+
+    #[test]
+    fn direct_stream_parses_configured_values() {
+        let raw = RawConfig {
+            direct_stream: Some(RawDirectStream {
+                proxy_url: Some("http://proxy.local:8080".into()),
+                api_password: Some("secret".into()),
+                request_timeout_ms: Some(4500),
+                response_buffer_bytes: Some(32_768),
+            }),
+            routes: vec![sample_route()],
+        };
+
+        let config = Config::try_from(raw).expect("configuration should load");
+        let direct = config
+            .direct_stream
+            .expect("direct stream configuration should be present");
+        assert_eq!(
+            direct.proxy_url.unwrap().as_str(),
+            "http://proxy.local:8080/"
+        );
+        assert_eq!(direct.api_password.as_deref(), Some("secret"));
+        assert_eq!(direct.request_timeout, Duration::from_millis(4500));
+        assert_eq!(direct.response_buffer_bytes, 32_768);
+    }
+
+    #[test]
+    fn direct_stream_env_overrides_create_configuration() {
+        let _guard = env_lock().lock().expect("env lock should be acquired");
+
+        env::remove_var("SPROX_DIRECT_PROXY_URL");
+        env::remove_var("SPROX_DIRECT_API_PASSWORD");
+        env::remove_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS");
+        env::remove_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES");
+
+        env::set_var("SPROX_DIRECT_PROXY_URL", "http://env-proxy:8080");
+        env::set_var("SPROX_DIRECT_API_PASSWORD", "env-secret");
+        env::set_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS", "12000");
+        env::set_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES", "131072");
+
+        let raw = RawConfig {
+            direct_stream: None,
+            routes: vec![sample_route()],
+        };
+
+        let config = Config::try_from(raw).expect("configuration should load");
+        let direct = config
+            .direct_stream
+            .expect("direct stream configuration should be present");
+        assert_eq!(direct.proxy_url.unwrap().as_str(), "http://env-proxy:8080/");
+        assert_eq!(direct.api_password.as_deref(), Some("env-secret"));
+        assert_eq!(direct.request_timeout, Duration::from_millis(12_000));
+        assert_eq!(direct.response_buffer_bytes, 131_072);
+
+        env::remove_var("SPROX_DIRECT_PROXY_URL");
+        env::remove_var("SPROX_DIRECT_API_PASSWORD");
+        env::remove_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS");
+        env::remove_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES");
     }
 }
