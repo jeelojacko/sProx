@@ -38,7 +38,7 @@ async fn health_endpoint_returns_success() {
         }],
     };
 
-    let state = build_app_state(&config);
+    let state = build_app_state(&config).expect("app state should build");
     let router = app::build_router(state);
 
     let listener_cfg = primary_listener(&config).expect("listener should be available");

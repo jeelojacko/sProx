@@ -22,6 +22,7 @@ use thiserror::Error;
 use tracing::{error, info};
 use url::Url;
 
+use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget};
 use crate::stream::hls;
 
@@ -37,6 +38,9 @@ pub enum ProxyError {
 
     #[error("no upstream route registered for host `{host}`")]
     RouteNotFound { host: String },
+
+    #[error("no upstream target configured for route `{route_id}`")]
+    RouteTargetNotFound { route_id: String },
 
     #[error("invalid upstream url `{url}`: {source}")]
     InvalidUpstreamUrl {
@@ -136,10 +140,18 @@ pub async fn forward(
 ) -> Result<Response<Body>, ProxyError> {
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
     let span = tracing::Span::current();
-    span.record("route.id", &tracing::field::display(&host));
     span.record("route.host", &tracing::field::display(&host));
 
-    let route = lookup_route(&state, &host).await?;
+    let protocol = determine_route_protocol(&request);
+    let port = extract_port(request.uri(), request.headers(), protocol);
+    let route_request = RouteRequest {
+        host: Some(host.as_str()),
+        protocol,
+        port,
+    };
+
+    let (route_id, route) = lookup_route(&state, &host, &route_request).await?;
+    span.record("route.id", &tracing::field::display(&route_id));
     let upstream_url = build_upstream_url(&route, request.uri())?;
     span.record("upstream.url", &tracing::field::display(&upstream_url));
     let manifest_url = upstream_url.clone();
@@ -328,6 +340,57 @@ fn normalize_host(value: &str) -> Option<String> {
     Some(trimmed.to_ascii_lowercase())
 }
 
+fn determine_route_protocol(request: &Request<Body>) -> RouteProtocol {
+    if let Some(protocol) = request
+        .uri()
+        .scheme_str()
+        .and_then(RouteProtocol::from_scheme)
+    {
+        return protocol;
+    }
+
+    if let Some(original_uri) = request.extensions().get::<OriginalUri>() {
+        if let Some(protocol) = original_uri
+            .0
+            .scheme_str()
+            .and_then(RouteProtocol::from_scheme)
+        {
+            return protocol;
+        }
+    }
+
+    RouteProtocol::Http
+}
+
+fn extract_port(uri: &Uri, headers: &HeaderMap, protocol: RouteProtocol) -> u16 {
+    if let Some(port) = uri.port_u16() {
+        return port;
+    }
+
+    if let Some(authority) = uri.authority() {
+        if let Some(port) = authority.port_u16() {
+            return port;
+        }
+    }
+
+    if let Some(value) = headers.get(HOST).and_then(|value| value.to_str().ok()) {
+        if let Ok(authority) = value.trim().parse::<http::uri::Authority>() {
+            if let Some(port) = authority.port_u16() {
+                return port;
+            }
+        }
+    }
+
+    default_port(protocol)
+}
+
+fn default_port(protocol: RouteProtocol) -> u16 {
+    match protocol {
+        RouteProtocol::Http => 80,
+        RouteProtocol::Https => 443,
+    }
+}
+
 fn determine_client_scheme(request: &Request<Body>) -> Option<String> {
     if let Some(scheme) = request.uri().scheme_str() {
         if let Some(normalized) = normalize_scheme(scheme) {
@@ -392,15 +455,30 @@ fn parse_x_forwarded_proto(header: &str) -> Option<String> {
         .find_map(normalize_scheme)
 }
 
-async fn lookup_route(state: &AppState, host: &str) -> Result<RouteTarget, ProxyError> {
+async fn lookup_route(
+    state: &AppState,
+    host: &str,
+    request: &RouteRequest<'_>,
+) -> Result<(String, RouteTarget), ProxyError> {
+    let routing_engine = state.routing_engine();
+    let definition =
+        routing_engine
+            .match_request(request)
+            .ok_or_else(|| ProxyError::RouteNotFound {
+                host: host.to_string(),
+            })?;
+
+    let route_id = definition.id.clone();
     let routing_table = state.routing_table();
     let table = routing_table.read().await;
-    table
-        .get(host)
+    let target = table
+        .get(&route_id)
         .cloned()
-        .ok_or_else(|| ProxyError::RouteNotFound {
-            host: host.to_string(),
-        })
+        .ok_or_else(|| ProxyError::RouteTargetNotFound {
+            route_id: route_id.clone(),
+        })?;
+
+    Ok((route_id, target))
 }
 
 fn build_client(route: &RouteTarget) -> Result<Client, ProxyError> {
@@ -546,6 +624,7 @@ fn prepare_upstream_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::{PortRange, RouteDefinition, RouteProtocol, RouteRequest, RoutingEngine};
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
@@ -554,7 +633,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, RwLock};
     use tokio::time::sleep;
     use tracing::field::{Field, Visit};
     use tracing::span::Id;
@@ -612,6 +691,26 @@ mod tests {
         });
 
         (addr, shutdown_tx)
+    }
+
+    fn build_state_with_routes(
+        definitions: Vec<RouteDefinition>,
+        targets: HashMap<String, RouteTarget>,
+    ) -> AppState {
+        AppState::with_components(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(targets)),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(
+                RoutingEngine::new(definitions).expect("routing engine should compile for tests"),
+            ),
+        )
+    }
+
+    fn state_with_single_route(definition: RouteDefinition, target: RouteTarget) -> AppState {
+        let mut targets = HashMap::new();
+        targets.insert(definition.id.clone(), target);
+        build_state_with_routes(vec![definition], targets)
     }
 
     #[test]
@@ -787,6 +886,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lookup_route_matches_host_glob() {
+        let definition = RouteDefinition {
+            id: "glob-route".into(),
+            host_patterns: vec!["*.example.net".into()],
+            protocols: vec![RouteProtocol::Http],
+            ports: vec![PortRange::new(80, 80).unwrap()],
+        };
+        let target = RouteTarget {
+            upstream: "http://example.com".into(),
+            ..Default::default()
+        };
+        let state = state_with_single_route(definition, target);
+
+        let request = RouteRequest {
+            host: Some("api.example.net"),
+            protocol: RouteProtocol::Http,
+            port: 80,
+        };
+
+        let (route_id, _) = lookup_route(&state, "api.example.net", &request)
+            .await
+            .expect("glob route should match");
+        assert_eq!(route_id, "glob-route");
+    }
+
+    #[tokio::test]
+    async fn lookup_route_considers_protocol() {
+        let definition = RouteDefinition {
+            id: "secure-route".into(),
+            host_patterns: vec!["secure.test".into()],
+            protocols: vec![RouteProtocol::Https],
+            ports: vec![PortRange::new(443, 443).unwrap()],
+        };
+        let target = RouteTarget {
+            upstream: "https://example.com".into(),
+            ..Default::default()
+        };
+        let state = state_with_single_route(definition, target);
+
+        let https_request = RouteRequest {
+            host: Some("secure.test"),
+            protocol: RouteProtocol::Https,
+            port: 443,
+        };
+        let (route_id, _) = lookup_route(&state, "secure.test", &https_request)
+            .await
+            .expect("https route should match");
+        assert_eq!(route_id, "secure-route");
+
+        let http_request = RouteRequest {
+            host: Some("secure.test"),
+            protocol: RouteProtocol::Http,
+            port: 443,
+        };
+        let error = lookup_route(&state, "secure.test", &http_request)
+            .await
+            .expect_err("http request should not match https route");
+        match error {
+            ProxyError::RouteNotFound { host } => assert_eq!(host, "secure.test"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_route_considers_port() {
+        let definition = RouteDefinition {
+            id: "port-route".into(),
+            host_patterns: vec!["edge.test".into()],
+            protocols: vec![RouteProtocol::Http],
+            ports: vec![PortRange::new(8000, 8005).unwrap()],
+        };
+        let target = RouteTarget {
+            upstream: "http://example.com".into(),
+            ..Default::default()
+        };
+        let state = state_with_single_route(definition, target);
+
+        let matching = RouteRequest {
+            host: Some("edge.test"),
+            protocol: RouteProtocol::Http,
+            port: 8003,
+        };
+        lookup_route(&state, "edge.test", &matching)
+            .await
+            .expect("port within range should match");
+
+        let mismatch = RouteRequest {
+            host: Some("edge.test"),
+            protocol: RouteProtocol::Http,
+            port: 9000,
+        };
+        let error = lookup_route(&state, "edge.test", &mismatch)
+            .await
+            .expect_err("port outside range should not match");
+        match error {
+            ProxyError::RouteNotFound { host } => assert_eq!(host, "edge.test"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn request_timeout_is_enforced_for_slow_upstream() {
         let delay = Duration::from_millis(250);
         let (addr, shutdown) = spawn_delayed_http_server(delay).await;
@@ -801,12 +1001,13 @@ mod tests {
             hls: None,
         };
 
-        let state = AppState::new();
-        state
-            .routing_table()
-            .write()
-            .await
-            .insert("timeout.test".into(), route);
+        let definition = RouteDefinition {
+            id: "timeout-route".into(),
+            host_patterns: vec!["timeout.test".into()],
+            protocols: vec![RouteProtocol::Http],
+            ports: vec![PortRange::new(80, 80).unwrap()],
+        };
+        let state = state_with_single_route(definition, route);
 
         let request = Request::builder()
             .uri("http://timeout.test/playlist.m3u8")
@@ -843,12 +1044,13 @@ mod tests {
             hls: None,
         };
 
-        let state = AppState::new();
-        state
-            .routing_table()
-            .write()
-            .await
-            .insert("timeout.test".into(), route);
+        let definition = RouteDefinition {
+            id: "read-timeout-route".into(),
+            host_patterns: vec!["timeout.test".into()],
+            protocols: vec![RouteProtocol::Http],
+            ports: vec![PortRange::new(80, 80).unwrap()],
+        };
+        let state = state_with_single_route(definition, route);
 
         let request = Request::builder()
             .uri("http://timeout.test/index.m3u8")
@@ -884,12 +1086,13 @@ mod tests {
             hls: None,
         };
 
-        let state = AppState::new();
-        state
-            .routing_table()
-            .write()
-            .await
-            .insert("trace.test".into(), route);
+        let definition = RouteDefinition {
+            id: "trace-route".into(),
+            host_patterns: vec!["trace.test".into()],
+            protocols: vec![RouteProtocol::Http],
+            ports: vec![PortRange::new(80, 80).unwrap()],
+        };
+        let state = state_with_single_route(definition, route);
 
         let request = Request::builder()
             .uri("http://trace.test/")
@@ -918,7 +1121,7 @@ mod tests {
         assert!(forward_span
             .fields
             .get("route.id")
-            .map(|value| value.contains("trace.test"))
+            .map(|value| value.contains("trace-route"))
             .unwrap_or(false));
         assert!(forward_span
             .fields
