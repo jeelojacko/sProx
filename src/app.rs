@@ -34,6 +34,7 @@ use crate::stream::dash;
 use crate::{
     proxy::{self, ProxyError},
     state::{AppState, RateLimitConfig},
+    stream::direct::handle_proxy_stream,
 };
 use futures::future::BoxFuture;
 use tower::limit::rate::{RateLimit, RateLimitLayer as TowerRateLimitLayer};
@@ -54,6 +55,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/ip", get(report_client_ip))
         .route("/speedtest", get(speedtest))
+        .route("/proxy/stream", get(handle_proxy_stream))
         .route("/keys", get(list_registered_keys));
 
     #[cfg(feature = "drm")]

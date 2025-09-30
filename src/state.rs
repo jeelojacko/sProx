@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Client;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -140,6 +141,7 @@ pub struct AppState {
     secrets: SharedSecretsStore,
     rate_limit: RateLimitConfig,
     routing_engine: SharedRoutingEngine,
+    http_client: Client,
 }
 
 impl AppState {
@@ -163,6 +165,7 @@ impl AppState {
             secrets,
             rate_limit: RateLimitConfig::default(),
             routing_engine,
+            http_client: Client::new(),
         }
     }
 
@@ -184,6 +187,11 @@ impl AppState {
     /// Returns a clone of the compiled routing engine handle.
     pub fn routing_engine(&self) -> SharedRoutingEngine {
         Arc::clone(&self.routing_engine)
+    }
+
+    /// Returns a clone of the shared HTTP client used for outbound requests.
+    pub fn http_client(&self) -> Client {
+        self.http_client.clone()
     }
 
     /// Returns the configured rate limit settings.
@@ -215,6 +223,7 @@ impl Default for AppState {
                 RoutingEngine::new(Vec::new())
                     .expect("routing engine should compile for empty routes"),
             ),
+            http_client: Client::new(),
         }
     }
 }

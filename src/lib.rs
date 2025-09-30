@@ -16,6 +16,7 @@ pub mod routing;
 pub mod security;
 pub mod state;
 pub mod stream;
+pub use stream::direct;
 #[cfg(feature = "telemetry")]
 mod telemetry;
 pub mod util;
