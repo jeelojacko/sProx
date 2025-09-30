@@ -97,8 +97,8 @@ fn build_app_state(config: &Config) -> Result<AppState> {
         let port_range = PortRange::new(route.listen.port, route.listen.port)?;
         route_definitions.push(RouteDefinition {
             id: route.id.clone(),
-            host_patterns: Vec::new(),
-            protocols: Vec::new(),
+            host_patterns: route.host_patterns.clone(),
+            protocols: route.protocols.clone(),
             ports: vec![port_range],
         });
     }

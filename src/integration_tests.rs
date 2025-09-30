@@ -17,6 +17,8 @@ async fn health_endpoint_returns_success() {
                 host: "127.0.0.1".into(),
                 port: 0,
             },
+            host_patterns: Vec::new(),
+            protocols: Vec::new(),
             upstream: UpstreamConfig {
                 origin: Url::parse("http://127.0.0.1:65535").expect("url should parse"),
                 connect_timeout: Some(Duration::from_secs(1)),
