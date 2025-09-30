@@ -5,6 +5,21 @@ streaming pipeline. Each script is intentionally verbose about the
 environment variables it expects so that the automation driving them can
 source values from a secrets manager or `.env` file.
 
+## Bundled binaries
+
+The official Docker image produced from this repository now bundles the
+following utilities so the helper scripts can run without additional
+setup:
+
+- **FFmpeg 5.1.4-0+deb12u1** (from Debian bookworm) is installed at
+  `/usr/bin/ffmpeg` and available via the default `PATH`.
+- **Shaka Packager v2.6.1** is installed as `/usr/local/bin/packager` with a
+  `shaka-packager` symlink for convenience.
+
+Deployments that rely on these images can invoke the scripts directly, or set
+`FFMPEG_BIN` / `SHAKA_BIN` to override the bundled versions when newer builds
+are desired.
+
 ## `ffmpeg_packager.sh`
 
 Encrypts a mezzanine file using FFmpeg's Common Encryption support. The script
