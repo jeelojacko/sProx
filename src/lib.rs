@@ -7,13 +7,16 @@
 //! workspace compiles while feature-gated dependencies are wired up.
 
 pub mod app;
+pub mod bandwidth;
 #[cfg(feature = "config-loader")]
 pub mod config;
+pub mod ip;
 pub mod proxy;
 pub mod routing;
 pub mod security;
 pub mod state;
 pub mod stream;
+pub mod util;
 
 /// Initializes crate-level resources. The implementation will be
 /// provided in later steps once configuration loading and telemetry are
