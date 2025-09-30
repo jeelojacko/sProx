@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const STDERR_CAPTURE_LIMIT: usize = 64 * 1024;
+// Limit buffered stdout chunks to avoid unbounded growth if the consumer stops polling.
+const STDOUT_CHANNEL_CAPACITY: usize = 32;
 
 /// User-facing error emitted when streaming conversion output fails.
 #[derive(Debug, Clone)]
@@ -125,7 +127,7 @@ impl ConversionSummary {
 pub struct ConversionHandle {
     program: String,
     args: Vec<String>,
-    receiver: mpsc::UnboundedReceiver<Result<Vec<u8>, ConversionStreamError>>,
+    receiver: mpsc::Receiver<Result<Vec<u8>, ConversionStreamError>>,
     completion: JoinHandle<Result<ConversionSummary, ConversionError>>,
 }
 
@@ -254,10 +256,10 @@ pub async fn spawn_packager(command: PackagerCommand) -> Result<ConversionHandle
             program: program.clone(),
         })?;
 
-    // Use an unbounded channel so stdout forwarding never blocks if the caller stops
-    // polling the stream but still awaits completion. Backpressure would otherwise cause
-    // the subprocess to deadlock once its stdout pipe fills.
-    let (sender, receiver) = mpsc::unbounded_channel();
+    // Keep a bounded channel so stdout data cannot grow without limit if the consumer
+    // stops polling temporarily. When the receiver falls behind we drop new data while
+    // continuing to drain the child's stdout to prevent deadlocks.
+    let (sender, receiver) = mpsc::channel(STDOUT_CHANNEL_CAPACITY);
 
     let stdout_handle = tokio::spawn(forward_stdout(stdout, program_for_stdout, sender));
     let stderr_handle = tokio::spawn(capture_stderr(stderr, program_for_stderr));
@@ -308,9 +310,10 @@ pub async fn spawn_packager(command: PackagerCommand) -> Result<ConversionHandle
 async fn forward_stdout(
     stdout: ChildStdout,
     program: String,
-    sender: mpsc::UnboundedSender<Result<Vec<u8>, ConversionStreamError>>,
+    sender: mpsc::Sender<Result<Vec<u8>, ConversionStreamError>>,
 ) -> Result<(), ConversionError> {
     let mut reader = BufReader::new(stdout);
+    let mut dropped_chunks = false;
 
     loop {
         let mut buffer = Vec::with_capacity(1024);
@@ -318,13 +321,31 @@ async fn forward_stdout(
         match read_result {
             Ok(0) => break,
             Ok(_) => {
-                if sender.send(Ok(buffer)).is_err() {
-                    break;
+                if dropped_chunks {
+                    match sender.try_send(Err(ConversionStreamError::new(
+                        "stdout consumer fell behind; dropping output",
+                    ))) {
+                        Ok(()) => {
+                            dropped_chunks = false;
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped_chunks = true;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+
+                match sender.try_send(Ok(buffer)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        dropped_chunks = true;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
             Err(err) => {
                 let message = err.to_string();
-                let _ = sender.send(Err(ConversionStreamError::new(message)));
+                let _ = sender.try_send(Err(ConversionStreamError::new(message)));
                 return Err(ConversionError::ReadStdout {
                     program,
                     source: err,
