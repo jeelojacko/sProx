@@ -1,32 +1,54 @@
 # sProx
 
-sProx is a Rust-based streaming proxy designed to orchestrate HTTP reverse proxying, adaptive bitrate manifest rewriting, and optional DASH-to-HLS conversion workflows. The project skeleton follows a modular layout so future tasks can iteratively flesh out the proxy engine, security primitives, and media tooling.
+sProx is a Rust-based streaming proxy tailored for HTTP video delivery workflows. The
+service sits between playback clients and one or more upstream origins, providing
+adaptive bitrate (ABR) manifest rewriting, optional DASH-to-HLS conversion, and a
+central place to enforce security controls. The codebase is intentionally modular so
+that individual sub-systems (routing, manifest processing, DRM) can be implemented in
+isolation while maintaining a cohesive data flow across the proxy pipeline.
 
-## Repository layout
+## Table of contents
+
+- [High-level architecture](#high-level-architecture)
+- [Configuration model](#configuration-model)
+- [Operational guidance](#operational-guidance)
+- [Local development](#local-development)
+- [Repository layout](#repository-layout)
+- [Additional documentation](#additional-documentation)
+
+## High-level architecture
+
+At a glance the proxy is split across three primary layers that collaborate to service
+requests:
 
 ```
-sProx/
-├─ Cargo.toml             # Rust manifest (to be populated in later tasks)
-├─ .env.example           # Sample environment variables (secrets are excluded)
-├─ config/                # Configuration files (routing rules, TLS toggles)
-├─ packagers/             # Helper scripts for FFmpeg/Shaka Packager
-├─ src/
-│  ├─ main.rs             # Application entry point (to be implemented)
-│  ├─ app.rs              # Axum application builder (future work)
-│  └─ stream/             # Streaming helpers (HLS, DASH, conversions)
-└─ docs/                  # Additional documentation and design notes
+┌────────────────────┐      ┌──────────────────────┐      ┌───────────────────────────┐
+│  Edge listeners    │◄────►│  Routing orchestrator │◄────►│  Streaming transformation │
+│  (Axum/Tokio)      │      │  & middleware         │      │  & cache adaptors          │
+└────────────────────┘      └──────────────────────┘      └───────────────────────────┘
+          │                            │                                 │
+          ▼                            ▼                                 ▼
+   TLS termination /          Policy enforcement                Manifest + segment
+   HTTP/2 upgrades            (authn/z, rate limiting)           rewriting, DRM hooks
 ```
 
-## Getting started
+1. **Edge listeners** – Tokio-based servers accept HTTP or HTTPS traffic (depending on
+   the route configuration) and normalise requests into an internal representation.
+2. **Routing orchestrator** – Selects the upstream origin for the request, applies
+   middleware (authentication, logging, rate limiting), and controls retries or failover.
+3. **Streaming transformation layer** – Performs manifest manipulation (HLS/DASH), URL
+   rewriting, optional transmuxing, and integrates with DRM key services.
 
-This repository currently contains the directory scaffolding only. Upcoming tasks will
-introduce the Rust crate setup, configuration loader, and the core proxy pipeline.
+Supporting modules provide telemetry (structured logging, metrics collectors), shared
+configuration stores, and async job workers for background housekeeping tasks (e.g.
+certificate rotation or cache warm-up). A more detailed component breakdown lives in
+[`docs/architecture-overview.md`](docs/architecture-overview.md).
 
-### Configuration
+## Configuration model
 
-A sample `config/routes.yaml` file is included to document the expected shape of routing
-rules. Each entry under `routes` defines a listener, the upstream origin it connects to,
-and optional transport toggles.
+All runtime behaviour is driven through declarative configuration files under the
+`config/` directory. The defaults focus on `config/routes.yaml`, which defines the set of
+listener endpoints and their downstream origins:
 
 ```yaml
 routes:
@@ -34,6 +56,8 @@ routes:
     listen:
       host: "0.0.0.0"
       port: 8080
+      tls:
+        enabled: false
     upstream:
       origin: "https://origin.example.com/vod"
       tls:
@@ -42,60 +66,120 @@ routes:
         insecure_skip_verify: false
       socks5:
         enabled: false
-        address: "127.0.0.1:1080"
     hls:
       enabled: true
       rewrite_playlist_urls: true
       base_url: "https://cdn.example.com/hls/"
+      drm:
+        clear_key_service: "https://drm.example.com/keys"
+        token_header: "Authorization"
 ```
 
-Schema highlights:
+Key configuration concepts:
 
-- `listen.host` / `listen.port` – Address where sProx accepts incoming connections for
-  the route.
-- `upstream.origin` – The absolute URL for the backend service or packager.
-- `upstream.tls` – Controls upstream TLS negotiation. Set `enabled` to `true` when the
-  origin expects HTTPS, optionally override the `sni_hostname`, and use
-  `insecure_skip_verify` only for local testing where certificate validation should be
-  bypassed.
-- `upstream.socks5` – When `enabled`, outbound traffic is tunnelled through the provided
-  SOCKS5 proxy `address`. Username and password fields are available for authenticated
-  proxies.
-- `hls` – Toggle playlist-aware behaviour. Use `rewrite_playlist_urls` and `base_url` to
-  emit absolute URLs pointing at your CDN or edge. `allow_insecure_segments` (see sample)
-  can be flipped to permit mixed HTTP/HTTPS playlists during migrations.
+- **Listeners** – Control the transport protocol (HTTP/1.1, HTTP/2, QUIC), TLS settings
+  for inbound traffic, and concurrency limits (to be implemented).
+- **Upstreams** – Describe where traffic is proxied, including TLS requirements,
+  optional SOCKS5 tunnelling, and retry budgets.
+- **Streaming toggles** – Enable playlist rewriting, segment URL translation, DRM key
+  acquisition, and future transcoding jobs.
+- **Environment overrides** – Sensitive values (API tokens, TLS private keys) are loaded
+  from environment variables. See `.env.example` for supported overrides.
 
-## Development tooling
+Each configuration file is validated during start-up. Failing validation should prevent
+the service from booting, which protects against partial rollouts with inconsistent
+manifests or insecure TLS policies.
 
-The workspace is configured to use a pinned stable toolchain defined in `rust-toolchain.toml`.
-Required components (Rustfmt and Clippy) are installed automatically by `rustup` when the
-toolchain is set. A couple of helper scripts are available for common commands:
+## Operational guidance
 
-- `./scripts/fmt.sh` – runs `cargo fmt --all` for full-workspace formatting.
-- `./scripts/clippy.sh` – runs Clippy across all targets and features with warnings treated as
-  errors.
+Operating a streaming proxy requires careful consideration of security, compliance, and
+performance characteristics:
 
-Additional Cargo aliases are defined in `.cargo/config.toml` for quick linting (for example,
-`cargo clippy-all`).
+- **TLS** –
+  - Terminate TLS at the edge listener when receiving HTTPS traffic from clients. Use
+    certificates issued by a trusted CA and enable OCSP stapling where possible.
+  - For upstream TLS, set `insecure_skip_verify` to `true` only in controlled testing
+    environments; production deployments must validate certificates to avoid MITM
+    attacks.
+  - Automate certificate rotation using ACME (Let’s Encrypt) or an internal PKI and keep
+    the private keys in restricted file system paths with correct permissions.
+- **Security warnings** –
+  - Always review manifest rewriting code paths to ensure URLs are not rewritten to
+    insecure schemas. Mixed content (HTTP in HTTPS manifests) can expose session data.
+  - Enable request logging and anomaly detection to spot credential stuffing or token
+    reuse attempts.
+  - When using SOCKS5 proxies, restrict access to authenticated tunnels and prefer
+    mutually authenticated TLS between sProx and the proxy server.
+- **DRM considerations** –
+  - Integrate with a key server over HTTPS and authenticate requests with short-lived
+    tokens. Cache keys in memory only for the duration required to fulfil client
+    requests.
+  - For Widevine or FairPlay workflows, ensure that sProx does not persist license
+    responses to disk and that all DRM metadata is encrypted in transit.
+- **Scaling** –
+  - Run multiple instances behind a load balancer to handle burst traffic. Horizontal
+    scaling is often preferable to single-node vertical scaling due to ABR manifest
+    concurrency patterns.
+  - Monitor CPU utilisation of manifest processing routines; heavy transmuxing should be
+    offloaded to dedicated media workers when possible.
 
-### Editor integration
+Further operational playbooks (disaster recovery, observability, canary rollouts) will be
+added as the implementation matures. For interim guidance consult
+[`docs/operational-notes.md`](docs/operational-notes.md).
 
-VS Code users can rely on the repository-provided `.vscode/settings.json`, which enables
-`rust-analyzer` with Clippy-based checks and format-on-save for Rust files. Recommended
-extensions (Rust Analyzer, Even Better TOML, Crates) are listed in `.vscode/extensions.json`.
+## Local development
 
-To prepare for future development, ensure that you have:
+1. **Install prerequisites**
+   - Rust toolchain (stable channel) via [`rustup`](https://rustup.rs/). The repository
+     pins the toolchain version in `rust-toolchain.toml`.
+   - `cargo` components: `rustfmt` and `clippy`. These install automatically when you
+     run `rustup component add rustfmt clippy` if they are missing.
+   - Optional: FFmpeg and Shaka Packager for validating manifest rewrites and transmuxing
+     flows during development.
+2. **Clone and bootstrap**
+   - `git clone https://github.com/<org>/sProx.git`
+   - `cd sProx`
+   - Copy `.env.example` to `.env` and customise values for local testing (tokens, TLS
+     file paths).
+3. **Run the toolchain**
+   - Format: `cargo fmt --all`
+   - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
+   - Test: `cargo test`
+   - Build: `cargo build`
+4. **Editor setup**
+   - VS Code users can leverage the provided `.vscode` workspace settings for
+     `rust-analyzer`, format-on-save, and Clippy diagnostics.
+   - For JetBrains or Neovim, ensure the Rust plugin reads `rust-toolchain.toml` so that
+     the correct compiler version is used for IDE features.
+5. **Running locally** (future implementation)
+   - Once the binary exposes runtime flags, start the proxy with
+     `cargo run -- --config config/routes.yaml`.
+   - Use tools like `curl` or [`hurl`](https://hurl.dev/) to validate basic proxying.
 
-- Rust installed via [rustup](https://rustup.rs/); syncing the toolchain is as easy as running
-  `rustup show` inside the repository.
-- FFmpeg and/or Shaka Packager available on your development machine if you plan to exercise
-  streaming conversion features later on.
-=======
-To prepare for future development, ensure that you have:
+## Repository layout
 
-- Rust toolchain (2021 edition or newer) installed via [rustup](https://rustup.rs/).
-- FFmpeg and/or Shaka Packager available on your development machine if you plan to
-  exercise streaming conversion features later on.
+```
+sProx/
+├─ Cargo.toml             # Rust manifest
+├─ .env.example           # Sample environment variables (secrets are excluded)
+├─ config/                # Configuration files (routing rules, TLS toggles)
+├─ docs/                  # Additional documentation and design notes
+├─ packagers/             # Helper scripts for FFmpeg/Shaka Packager
+├─ scripts/               # Repository automation (formatting, linting)
+└─ src/
+   ├─ main.rs             # Application entry point (to be implemented)
+   ├─ app.rs              # Axum application builder (future work)
+   └─ stream/             # Streaming helpers (HLS, DASH, conversions)
+```
 
+## Additional documentation
 
-Further documentation and setup steps will be added as the implementation progresses.
+Supplementary documents live in the `docs/` directory:
+
+- [`architecture-overview.md`](docs/architecture-overview.md) – expanded diagrams and
+  explanations of planned subsystems.
+- [`operational-notes.md`](docs/operational-notes.md) – security, TLS, and DRM checklists
+  for running sProx in production.
+
+These documents will evolve alongside feature development; contributions that keep the
+architecture and operational runbooks up to date are welcome.
