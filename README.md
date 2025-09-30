@@ -156,6 +156,33 @@ added as the implementation matures. For interim guidance consult
      `cargo run -- --config config/routes.yaml`.
    - Use tools like `curl` or [`hurl`](https://hurl.dev/) to validate basic proxying.
 
+## Containerized workflow
+
+Build and run the proxy in a container to match production-like deployments or to
+avoid installing the Rust toolchain locally:
+
+```bash
+# Build the optimized image
+docker build -t sprox:latest .
+
+# Run the container, exposing the default listener and mounting local configs
+docker run --rm \
+  -p 8080:8080 \
+  -v "$(pwd)/config:/app/config:ro" \
+  sprox:latest --config config/routes.yaml
+```
+
+The `scripts/docker-run.sh` helper automates the build/run workflow. It produces a
+local `sprox:local` image (override with `IMAGE_NAME`) and starts the container with
+the configuration directory mounted read-only:
+
+```bash
+./scripts/docker-run.sh
+```
+
+Pass any additional arguments after the script invocation to forward them to the
+containerized binary (for example `./scripts/docker-run.sh --config config/routes.yaml`).
+
 ## Repository layout
 
 ```
