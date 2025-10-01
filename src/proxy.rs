@@ -647,7 +647,7 @@ fn prepare_upstream_headers(
 mod tests {
     use super::*;
     use crate::routing::{PortRange, RouteDefinition, RouteProtocol, RouteRequest, RoutingEngine};
-    use crate::state::RetryPolicy;
+    use crate::state::{RetryPolicy, SecretsStore};
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
@@ -781,7 +781,7 @@ mod tests {
         AppState::with_components(
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(RwLock::new(targets)),
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(SecretsStore::default())),
             Arc::new(
                 RoutingEngine::new(definitions).expect("routing engine should compile for tests"),
             ),

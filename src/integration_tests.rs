@@ -23,7 +23,8 @@ use url::Url;
 
 use sProx::config::{
     Config, DirectStreamAllowRule, DirectStreamAllowlist, DirectStreamConfig, DirectStreamScheme,
-    ListenerConfig, RetryConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig,
+    ListenerConfig, RetryConfig, RouteConfig, SecretsConfig, SensitiveLoggingConfig, Socks5Config,
+    TlsConfig, UpstreamConfig,
 };
 use sProx::state::{AppState, DirectStreamSettings};
 
@@ -59,6 +60,8 @@ async fn health_endpoint_returns_success() {
             },
             hls: None,
         }],
+        secrets: SecretsConfig::default(),
+        sensitive_logging: SensitiveLoggingConfig::default(),
     };
 
     let state = build_app_state(&config).expect("app state should build");
@@ -139,6 +142,8 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
             route_template("disabled-proxy", false, None),
             route_template("enabled-proxy", true, Some("10.0.0.1:9000")),
         ],
+        secrets: SecretsConfig::default(),
+        sensitive_logging: SensitiveLoggingConfig::default(),
     };
 
     let state = build_app_state(&config).expect("app state should build");

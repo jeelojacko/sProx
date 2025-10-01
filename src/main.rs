@@ -12,7 +12,7 @@ use sProx::{
     app,
     config::{Config, ListenerConfig},
     routing::{PortRange, RouteDefinition, RoutingEngine},
-    state::{AppState, HlsOptions, RouteTarget, Socks5Proxy},
+    state::{AppState, HlsOptions, RouteTarget, SecretsStore, Socks5Proxy},
 };
 use tokio::{net::TcpListener, sync::RwLock};
 
@@ -119,13 +119,15 @@ fn build_app_state(config: &Config) -> Result<AppState> {
     let mut state = AppState::with_components(
         Arc::new(RwLock::new(HashMap::new())),
         Arc::new(RwLock::new(routing_table)),
-        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(RwLock::new(SecretsStore::new(config.secrets.default_ttl))),
         routing_engine,
     );
 
     if let Some(direct_stream) = config.direct_stream.clone() {
         state = state.with_direct_stream_settings(direct_stream.into());
     }
+
+    state = state.with_sensitive_logging(config.sensitive_logging.clone().into());
 
     Ok(state)
 }
