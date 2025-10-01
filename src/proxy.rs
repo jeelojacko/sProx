@@ -716,6 +716,64 @@ mod tests {
         (addr, shutdown_tx)
     }
 
+    async fn spawn_static_response_server(
+        body: &'static [u8],
+        content_type: &'static str,
+    ) -> (std::net::SocketAddr, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("static server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose local addr");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                    accept = listener.accept() => {
+                        let (mut stream, _) = match accept {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        };
+
+                        let mut buffer = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        loop {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buffer.extend_from_slice(&chunk[..n]);
+                                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => {
+                                    return;
+                                }
+                            }
+                        }
+
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                            content_type
+                        );
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        let _ = stream.write_all(body).await;
+                    }
+                }
+            }
+        });
+
+        (addr, shutdown_tx)
+    }
+
     fn build_state_with_routes(
         definitions: Vec<RouteDefinition>,
         targets: HashMap<String, RouteTarget>,
@@ -1291,6 +1349,85 @@ mod tests {
                     fields: visitor.fields,
                 });
             }
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    mod telemetry_integration {
+        use super::*;
+        use crate::state::HlsOptions;
+        use axum::body::to_bytes;
+
+        const SAMPLE_VARIANT_MANIFEST: &str = "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MAP:URI=\"init/init.mp4\",BYTERANGE=\"720@0\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.key\",IV=0x1ABC\n#EXT-X-STREAM-INF:BANDWIDTH=1280000,AVERAGE-BANDWIDTH=1100000,CODECS=\"avc1.640029,mp4a.40.2\"\nvideo/main.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360\nhttp://origin.example.com/video/low.m3u8\n";
+
+        #[tokio::test]
+        async fn hls_manifests_are_rewritten_without_mixed_content() {
+            let (addr, shutdown) = spawn_static_response_server(
+                SAMPLE_VARIANT_MANIFEST.as_bytes(),
+                "application/vnd.apple.mpegurl",
+            )
+            .await;
+
+            let hls_options = HlsOptions {
+                enabled: true,
+                rewrite_playlist_urls: true,
+                base_url: Some(Url::parse("https://cdn.example.com/hls/").unwrap()),
+                allow_insecure_segments: false,
+            };
+
+            let route = RouteTarget {
+                upstream: format!("http://{}", addr),
+                connect_timeout: Some(Duration::from_secs(1)),
+                read_timeout: Some(Duration::from_secs(1)),
+                request_timeout: Some(Duration::from_secs(1)),
+                tls_insecure_skip_verify: false,
+                socks5: None,
+                hls: Some(hls_options),
+                retry: RetryPolicy::default(),
+            };
+
+            let definition = RouteDefinition {
+                id: "hls-route".into(),
+                host_patterns: vec!["cdn.test".into()],
+                protocols: vec![RouteProtocol::Http],
+                ports: vec![PortRange::new(80, 80).unwrap()],
+            };
+            let state = state_with_single_route(definition, route);
+
+            let request = Request::builder()
+                .uri("http://cdn.test/master.m3u8")
+                .header(HOST, "cdn.test")
+                .body(Body::empty())
+                .unwrap();
+
+            let response = forward(state.clone(), request)
+                .await
+                .expect("forward should succeed");
+
+            assert_eq!(response.status(), http::StatusCode::OK);
+
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body should be readable");
+            let output = String::from_utf8(body.to_vec()).expect("manifest should remain UTF-8");
+
+            assert!(output.contains(
+                "#EXT-X-MAP:URI=\"https://cdn.example.com/hls/init/init.mp4\",BYTERANGE=\"720@0\""
+            ));
+            assert!(output.contains(
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"https://cdn.example.com/hls/keys/key.key\",IV=0x1ABC"
+            ));
+            assert!(output.contains(
+                "#EXT-X-STREAM-INF:BANDWIDTH=1280000,AVERAGE-BANDWIDTH=1100000,CODECS=\"avc1.640029,mp4a.40.2\""
+            ));
+            assert!(output.contains("https://cdn.example.com/hls/video/main.m3u8"));
+            assert!(output.contains("https://cdn.example.com/hls/video/low.m3u8"));
+            assert!(
+                !output.contains("http://"),
+                "rewritten manifest should not include insecure URLs"
+            );
+
+            let _ = shutdown.send(());
         }
     }
 }
