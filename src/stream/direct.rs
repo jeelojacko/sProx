@@ -37,6 +37,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::form_urlencoded;
 
+use crate::retry;
 use crate::state::{AppState, DirectStreamSettings};
 
 const DIRECT_STREAM_PASSWORD_HEADER: &str = "x-sprox-api-password";
@@ -177,6 +178,9 @@ enum DirectStreamError {
     #[error("upstream request failed: {source}")]
     UpstreamRequest { source: reqwest::Error },
 
+    #[error("retry budget exhausted for upstream request: {source}")]
+    RetryBudgetExhausted { source: reqwest::Error },
+
     #[error("upstream returned status {status}")]
     UpstreamStatus { status: StatusCode },
 
@@ -287,6 +291,10 @@ impl DirectStreamError {
                     )
                 }
             }
+            Self::RetryBudgetExhausted { source } => (
+                StatusCode::BAD_GATEWAY,
+                format!("retry budget exhausted for upstream request: {source}"),
+            ),
             Self::UpstreamStatus { status } => {
                 (status, format!("upstream responded with status {status}"))
             }
@@ -586,20 +594,35 @@ impl DirectStreamService {
         loop {
             self.validate_destination(&current_url).await?;
 
-            let response = self
+            let request = self
                 .client
                 .request(method.clone(), current_url.clone())
                 .headers(headers.clone())
                 .timeout(self.settings.request_timeout())
-                .send()
-                .await
-                .map_err(|error| match extract_restricted_ip(&error) {
-                    Some(ip) => DirectStreamError::DestinationAddressRestricted {
-                        url: current_url.to_string(),
-                        ip,
-                    },
-                    None => DirectStreamError::UpstreamRequest { source: error },
-                })?;
+                .build()
+                .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
+
+            let retry_policy = self.settings.retry().clone();
+            let response =
+                match retry::execute_with_retry(self.client.clone(), request, retry_policy).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let budget_exhausted = error.is_budget_exhausted();
+                        let source = error.into_source();
+                        if let Some(ip) = extract_restricted_ip(&source) {
+                            return Err(DirectStreamError::DestinationAddressRestricted {
+                                url: current_url.to_string(),
+                                ip,
+                            });
+                        }
+
+                        if budget_exhausted {
+                            return Err(DirectStreamError::RetryBudgetExhausted { source });
+                        }
+
+                        return Err(DirectStreamError::UpstreamRequest { source });
+                    }
+                };
 
             if let Some(next_url) = self.extract_redirect(&current_url, &response)? {
                 redirects += 1;

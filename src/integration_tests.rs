@@ -23,7 +23,7 @@ use url::Url;
 
 use sProx::config::{
     Config, DirectStreamAllowRule, DirectStreamAllowlist, DirectStreamConfig, DirectStreamScheme,
-    ListenerConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig,
+    ListenerConfig, RetryConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig,
 };
 use sProx::state::{AppState, DirectStreamSettings};
 
@@ -55,6 +55,7 @@ async fn health_endpoint_returns_success() {
                     username: None,
                     password: None,
                 },
+                retry: RetryConfig::default(),
             },
             hls: None,
         }],
@@ -127,6 +128,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
                     username: Some("user".into()),
                     password: Some("secret".into()),
                 },
+                retry: RetryConfig::default(),
             },
             hls: None,
         };
@@ -201,6 +203,102 @@ async fn proxy_stream_returns_full_body_and_injects_accept_ranges() {
         .collect::<Vec<_>>();
     assert!(requests.contains(&Method::HEAD));
     assert!(requests.contains(&Method::GET));
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_retries_transient_failures() {
+    let body = b"abcdef".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+    context.upstream_state().set_transient_failures(2).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should succeed despite transient failures");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes, body);
+
+    let upstream_log = context.upstream_log();
+    let log = upstream_log.lock().await;
+    let head_attempts = log
+        .iter()
+        .filter(|entry| entry.method == Method::HEAD)
+        .count();
+    let get_attempts = log
+        .iter()
+        .filter(|entry| entry.method == Method::GET)
+        .count();
+    assert_eq!(head_attempts, 1);
+    assert_eq!(get_attempts, 3);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_reports_retry_budget_exhaustion() {
+    let body = b"failure".to_vec();
+    let context = spawn_stream_test_with_config_builder(body.clone(), |addr| {
+        let domain = addr.ip().to_string();
+        let mut retry = RetryConfig::default();
+        retry.budget.min_per_sec = 0;
+        retry.budget.retry_ratio = 0.0;
+
+        DirectStreamConfig {
+            allowlist: DirectStreamAllowlist {
+                rules: vec![DirectStreamAllowRule {
+                    domain,
+                    schemes: vec![DirectStreamScheme::Http],
+                    path_globs: vec!["/**".into()],
+                }],
+            },
+            retry,
+            ..Default::default()
+        }
+    })
+    .await;
+    context.upstream_state().set_transient_failures(1).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let message = response.text().await.expect("body should decode");
+    assert!(message.contains("retry budget exhausted"));
+
+    let upstream_log = context.upstream_log();
+    let log = upstream_log.lock().await;
+    let head_attempts = log
+        .iter()
+        .filter(|entry| entry.method == Method::HEAD)
+        .count();
+    let get_attempts = log
+        .iter()
+        .filter(|entry| entry.method == Method::GET)
+        .count();
+    assert_eq!(head_attempts, 1);
+    assert_eq!(get_attempts, 1, "budget should prevent retry attempts");
 
     context.shutdown().await;
 }
@@ -592,12 +690,12 @@ async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
     .await
 }
 
-async fn spawn_stream_test_with_allowlist<F>(
+async fn spawn_stream_test_with_config_builder<F>(
     body: Vec<u8>,
-    allowlist_builder: F,
+    config_builder: F,
 ) -> StreamTestContext
 where
-    F: Fn(SocketAddr) -> DirectStreamAllowlist,
+    F: Fn(SocketAddr) -> DirectStreamConfig,
 {
     let upstream_state = UpstreamState::new(body);
     let upstream_log = upstream_state.log.clone();
@@ -620,10 +718,7 @@ where
             .await
     });
 
-    let direct_stream = DirectStreamConfig {
-        allowlist: allowlist_builder(upstream_addr),
-        ..DirectStreamConfig::default()
-    };
+    let direct_stream = config_builder(upstream_addr);
     let settings: DirectStreamSettings = direct_stream.into();
 
     let app_state = AppState::new().with_direct_stream_settings(settings);
@@ -655,6 +750,20 @@ where
     }
 }
 
+async fn spawn_stream_test_with_allowlist<F>(
+    body: Vec<u8>,
+    allowlist_builder: F,
+) -> StreamTestContext
+where
+    F: Fn(SocketAddr) -> DirectStreamAllowlist,
+{
+    spawn_stream_test_with_config_builder(body, |addr| DirectStreamConfig {
+        allowlist: allowlist_builder(addr),
+        ..DirectStreamConfig::default()
+    })
+    .await
+}
+
 #[derive(Clone)]
 struct UpstreamState {
     body: Arc<Vec<u8>>,
@@ -675,6 +784,10 @@ impl UpstreamState {
 
     async fn add_redirect(&self, path: &str, target: String) {
         self.redirects.lock().await.insert(path.to_string(), target);
+    }
+
+    async fn set_transient_failures(&self, attempts: usize) {
+        self.config.lock().await.fail_get_attempts = attempts;
     }
 
     async fn redirect_target(&self, path: &str) -> Option<String> {
@@ -702,6 +815,7 @@ struct TestUpstreamConfig {
     chunk_size: usize,
     etag: String,
     last_modified: String,
+    fail_get_attempts: usize,
 }
 
 impl Default for TestUpstreamConfig {
@@ -711,6 +825,7 @@ impl Default for TestUpstreamConfig {
             chunk_size: 4,
             etag: "test-etag".to_string(),
             last_modified: "Tue, 20 Feb 2024 10:00:00 GMT".to_string(),
+            fail_get_attempts: 0,
         }
     }
 }
@@ -759,7 +874,26 @@ async fn upstream_handler(
         .get(header::IF_RANGE)
         .and_then(|value| value.to_str().ok());
 
-    let config = { state.config.lock().await.clone() };
+    let mut config_guard = state.config.lock().await;
+    if method != Method::HEAD && config_guard.fail_get_attempts > 0 {
+        config_guard.fail_get_attempts -= 1;
+        drop(config_guard);
+
+        let error_stream = stream::once(async {
+            Err::<AxumBytes, axum::Error>(axum::Error::new(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "transient failure",
+            )))
+        });
+
+        return AxumResponse::builder()
+            .status(AxumStatusCode::OK)
+            .body(AxumBody::from_stream(error_stream))
+            .expect("transient failure response should build");
+    }
+
+    let config = config_guard.clone();
+    drop(config_guard);
 
     let allow_partial = match if_range {
         Some(token) => token == config.etag || token == config.last_modified,
@@ -805,22 +939,20 @@ async fn upstream_handler(
         builder
             .body(AxumBody::empty())
             .expect("head response should build")
+    } else if config.chunked {
+        let chunk_size = config.chunk_size;
+        let chunks = slice
+            .chunks(chunk_size)
+            .map(AxumBytes::copy_from_slice)
+            .collect::<Vec<_>>();
+        let stream = stream::iter(chunks.into_iter().map(Ok::<_, Infallible>));
+        builder
+            .body(AxumBody::from_stream(stream))
+            .expect("chunked response should build")
     } else {
-        if config.chunked {
-            let chunk_size = config.chunk_size;
-            let chunks = slice
-                .chunks(chunk_size)
-                .map(|chunk| AxumBytes::copy_from_slice(chunk))
-                .collect::<Vec<_>>();
-            let stream = stream::iter(chunks.into_iter().map(|chunk| Ok::<_, Infallible>(chunk)));
-            builder
-                .body(AxumBody::from_stream(stream))
-                .expect("chunked response should build")
-        } else {
-            builder
-                .body(AxumBody::from(slice))
-                .expect("get response should build")
-        }
+        builder
+            .body(AxumBody::from(slice))
+            .expect("get response should build")
     }
 }
 

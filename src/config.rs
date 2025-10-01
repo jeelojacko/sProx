@@ -1,4 +1,5 @@
 use std::env;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,9 +21,12 @@ pub struct Config {
 pub struct DirectStreamConfig {
     pub proxy_url: Option<Url>,
     pub api_password: Option<String>,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
     pub request_timeout: Duration,
     pub response_buffer_bytes: usize,
     pub allowlist: DirectStreamAllowlist,
+    pub retry: RetryConfig,
 }
 
 impl DirectStreamConfig {
@@ -42,9 +46,12 @@ impl Default for DirectStreamConfig {
         Self {
             proxy_url: None,
             api_password: None,
+            connect_timeout: Some(Duration::from_secs(10)),
+            read_timeout: Some(Duration::from_secs(30)),
             request_timeout: Self::default_request_timeout(),
             response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
             allowlist: DirectStreamAllowlist::default(),
+            retry: RetryConfig::default(),
         }
     }
 }
@@ -112,6 +119,60 @@ pub struct UpstreamConfig {
     pub request_timeout: Option<Duration>,
     pub tls: TlsConfig,
     pub socks5: Socks5Config,
+    pub retry: RetryConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: NonZeroU32,
+    pub backoff: RetryBackoffConfig,
+    pub budget: RetryBudgetConfig,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: NonZeroU32::new(3).expect("static non-zero"),
+            backoff: RetryBackoffConfig::default(),
+            budget: RetryBudgetConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryBackoffConfig {
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    pub multiplier: f64,
+    pub jitter: f64,
+}
+
+impl Default for RetryBackoffConfig {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+            multiplier: 2.0,
+            jitter: 0.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryBudgetConfig {
+    pub ttl: Duration,
+    pub min_per_sec: u32,
+    pub retry_ratio: f32,
+}
+
+impl Default for RetryBudgetConfig {
+    fn default() -> Self {
+        Self {
+            ttl: Duration::from_secs(10),
+            min_per_sec: 10,
+            retry_ratio: 0.2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,11 +256,17 @@ struct RawDirectStream {
     #[serde(default)]
     api_password: Option<String>,
     #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    read_timeout_ms: Option<u64>,
+    #[serde(default)]
     request_timeout_ms: Option<u64>,
     #[serde(default)]
     response_buffer_bytes: Option<usize>,
     #[serde(default)]
     allowlist: Vec<RawDirectStreamAllowRule>,
+    #[serde(default)]
+    retry: Option<RawRetry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +310,8 @@ struct RawUpstream {
     tls: RawTls,
     #[serde(default)]
     socks5: RawSocks5,
+    #[serde(default)]
+    retry: Option<RawRetry>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -279,6 +348,38 @@ struct RawHls {
     base_url: Option<String>,
     #[serde(default)]
     allow_insecure_segments: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawRetry {
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    backoff: Option<RawRetryBackoff>,
+    #[serde(default)]
+    budget: Option<RawRetryBudget>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawRetryBackoff {
+    #[serde(default)]
+    initial_delay_ms: Option<u64>,
+    #[serde(default)]
+    max_delay_ms: Option<u64>,
+    #[serde(default)]
+    multiplier: Option<f64>,
+    #[serde(default)]
+    jitter: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawRetryBudget {
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    min_per_sec: Option<u32>,
+    #[serde(default)]
+    retry_ratio: Option<f32>,
 }
 
 impl TryFrom<RawConfig> for Config {
@@ -442,6 +543,16 @@ impl RawDirectStream {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
 
+        config.connect_timeout = optional_duration_from_millis(
+            self.connect_timeout_ms,
+            format!("{context}.connect_timeout_ms"),
+        )?;
+
+        config.read_timeout = optional_duration_from_millis(
+            self.read_timeout_ms,
+            format!("{context}.read_timeout_ms"),
+        )?;
+
         if let Some(timeout_ms) = self.request_timeout_ms {
             config.request_timeout =
                 duration_from_millis(timeout_ms, format!("{context}.request_timeout_ms"))?;
@@ -453,6 +564,7 @@ impl RawDirectStream {
         }
 
         config.allowlist = parse_direct_stream_allowlist(self.allowlist, context)?;
+        config.retry = parse_retry(self.retry, format!("{context}.retry"))?;
 
         Ok(config)
     }
@@ -537,6 +649,79 @@ fn parse_direct_stream_allowlist(
     Ok(DirectStreamAllowlist { rules: parsed })
 }
 
+fn parse_retry(raw: Option<RawRetry>, context: String) -> Result<RetryConfig, ConfigError> {
+    let mut retry = RetryConfig::default();
+
+    let Some(raw) = raw else {
+        return Ok(retry);
+    };
+
+    if let Some(max_attempts) = raw.max_attempts {
+        if max_attempts == 0 {
+            return Err(validation_error(
+                format!("{context}.max_attempts"),
+                "max_attempts must be greater than zero",
+            ));
+        }
+
+        retry.max_attempts = NonZeroU32::new(max_attempts).expect("checked above");
+    }
+
+    if let Some(backoff) = raw.backoff {
+        if let Some(initial_ms) = backoff.initial_delay_ms {
+            retry.backoff.initial_delay =
+                duration_from_millis(initial_ms, format!("{context}.backoff.initial_delay_ms"))?;
+        }
+
+        if let Some(max_ms) = backoff.max_delay_ms {
+            retry.backoff.max_delay =
+                duration_from_millis(max_ms, format!("{context}.backoff.max_delay_ms"))?;
+        }
+
+        if let Some(multiplier) = backoff.multiplier {
+            if multiplier < 1.0 {
+                return Err(validation_error(
+                    format!("{context}.backoff.multiplier"),
+                    "multiplier must be greater than or equal to 1.0",
+                ));
+            }
+            retry.backoff.multiplier = multiplier;
+        }
+
+        if let Some(jitter) = backoff.jitter {
+            if !(0.0..=1.0).contains(&jitter) {
+                return Err(validation_error(
+                    format!("{context}.backoff.jitter"),
+                    "jitter must be between 0.0 and 1.0",
+                ));
+            }
+            retry.backoff.jitter = jitter;
+        }
+    }
+
+    if let Some(budget) = raw.budget {
+        if let Some(ttl_ms) = budget.ttl_ms {
+            retry.budget.ttl = duration_from_millis(ttl_ms, format!("{context}.budget.ttl_ms"))?;
+        }
+
+        if let Some(min_per_sec) = budget.min_per_sec {
+            retry.budget.min_per_sec = min_per_sec;
+        }
+
+        if let Some(ratio) = budget.retry_ratio {
+            if !(0.0..=1000.0).contains(&ratio) {
+                return Err(validation_error(
+                    format!("{context}.budget.retry_ratio"),
+                    "retry_ratio must be between 0.0 and 1000.0",
+                ));
+            }
+            retry.budget.retry_ratio = ratio;
+        }
+    }
+
+    Ok(retry)
+}
+
 fn parse_listener(raw: RawListener, context: &str) -> Result<ListenerConfig, ConfigError> {
     if raw.host.trim().is_empty() {
         return Err(validation_error(
@@ -582,6 +767,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
     let tls_context = format!("{context}.upstream.tls");
     let tls = parse_tls(raw.tls, &tls_context);
     let socks5 = parse_socks5(raw.socks5, context)?;
+    let retry = parse_retry(raw.retry, format!("{context}.upstream.retry"))?;
 
     Ok(UpstreamConfig {
         origin,
@@ -590,6 +776,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         request_timeout,
         tls,
         socks5,
+        retry,
     })
 }
 
@@ -807,6 +994,7 @@ mod tests {
                 request_timeout_ms: Some(1000),
                 tls: RawTls::default(),
                 socks5: RawSocks5::default(),
+                retry: None,
             },
             hls: None,
         }
@@ -880,6 +1068,7 @@ mod tests {
                     request_timeout_ms: None,
                     tls: RawTls::default(),
                     socks5: RawSocks5::default(),
+                    retry: None,
                 },
                 hls: None,
             }],
@@ -911,9 +1100,25 @@ mod tests {
             direct_stream: Some(RawDirectStream {
                 proxy_url: Some("http://proxy.local:8080".into()),
                 api_password: Some("secret".into()),
+                connect_timeout_ms: Some(1500),
+                read_timeout_ms: Some(3500),
                 request_timeout_ms: Some(4500),
                 response_buffer_bytes: Some(32_768),
                 allowlist: Vec::new(),
+                retry: Some(RawRetry {
+                    max_attempts: Some(5),
+                    backoff: Some(RawRetryBackoff {
+                        initial_delay_ms: Some(25),
+                        max_delay_ms: Some(500),
+                        multiplier: Some(1.5),
+                        jitter: Some(0.1),
+                    }),
+                    budget: Some(RawRetryBudget {
+                        ttl_ms: Some(5_000),
+                        min_per_sec: Some(1),
+                        retry_ratio: Some(0.5),
+                    }),
+                }),
             }),
             routes: vec![sample_route()],
         };
@@ -927,8 +1132,21 @@ mod tests {
             "http://proxy.local:8080/"
         );
         assert_eq!(direct.api_password.as_deref(), Some("secret"));
+        assert_eq!(direct.connect_timeout, Some(Duration::from_millis(1500)));
+        assert_eq!(direct.read_timeout, Some(Duration::from_millis(3500)));
         assert_eq!(direct.request_timeout, Duration::from_millis(4500));
         assert_eq!(direct.response_buffer_bytes, 32_768);
+        assert_eq!(direct.retry.max_attempts, NonZeroU32::new(5).unwrap());
+        assert_eq!(
+            direct.retry.backoff.initial_delay,
+            Duration::from_millis(25)
+        );
+        assert_eq!(direct.retry.backoff.max_delay, Duration::from_millis(500));
+        assert!((direct.retry.backoff.multiplier - 1.5).abs() < f64::EPSILON);
+        assert!((direct.retry.backoff.jitter - 0.1).abs() < f64::EPSILON);
+        assert_eq!(direct.retry.budget.ttl, Duration::from_millis(5_000));
+        assert_eq!(direct.retry.budget.min_per_sec, 1);
+        assert!((direct.retry.budget.retry_ratio - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]
