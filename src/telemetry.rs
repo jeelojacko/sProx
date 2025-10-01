@@ -56,6 +56,18 @@ fn init_metrics() -> Result<()> {
         "Latency histogram (in seconds) for HTTP responses emitted by the proxy."
     );
     metrics::describe_counter!(
+        "sprox_requests_total",
+        "Total number of upstream requests issued by the proxy, labelled by route."
+    );
+    metrics::describe_histogram!(
+        "sprox_upstream_latency_seconds",
+        "Latency histogram (in seconds) for upstream requests grouped by route."
+    );
+    metrics::describe_counter!(
+        "sprox_bytes_streamed_total",
+        "Total number of response bytes streamed back to clients from upstream services."
+    );
+    metrics::describe_counter!(
         "sprox_health_checks_total",
         "Total number of successful /health responses served."
     );

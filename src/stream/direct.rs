@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fmt, io,
     net::{IpAddr, SocketAddr},
+    time::Instant,
 };
 
 use axum::{
@@ -39,6 +40,8 @@ use url::form_urlencoded;
 
 use crate::retry;
 use crate::state::{AppState, DirectStreamSettings};
+use crate::util;
+use tracing::{error, info};
 
 const DIRECT_STREAM_PASSWORD_HEADER: &str = "x-sprox-api-password";
 const DIRECT_STREAM_PASSWORD_QUERY_KEY: &str = "api_password";
@@ -324,13 +327,24 @@ impl DirectStreamError {
     }
 }
 
-#[tracing::instrument(name = "stream.direct", skip(state, downstream_headers))]
+#[tracing::instrument(
+    name = "stream.direct",
+    skip(state, downstream_headers),
+    fields(
+        request.id = tracing::field::Empty,
+        upstream.url = tracing::field::Empty
+    )
+)]
 pub async fn handle_proxy_stream(
     State(state): State<AppState>,
     downstream_headers: HeaderMap,
     uri: Uri,
     Query(query): Query<DirectStreamQuery>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
+    let request_id = util::extract_request_id(&downstream_headers);
+    let span = tracing::Span::current();
+    span.record("request.id", &tracing::field::display(&request_id));
+
     if query.d.trim().is_empty() {
         return Err(DirectStreamError::MissingDestination.into_response());
     }
@@ -350,6 +364,7 @@ pub async fn handle_proxy_stream(
 
     let upstream_url = Url::parse(&query.d)
         .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
+    span.record("upstream.url", &tracing::field::display(&upstream_url));
 
     let settings = state.direct_stream_settings().cloned().unwrap_or_default();
 
@@ -362,10 +377,61 @@ pub async fn handle_proxy_stream(
         .map_err(|source| DirectStreamError::ClientBuild { source }.into_response())?;
     let service = DirectStreamService::new(client, settings);
 
-    service
-        .stream(upstream_url, upstream_headers)
-        .await
-        .map_err(|error| error.into_response())
+    let start = Instant::now();
+    let stream_result = match service.stream(upstream_url, upstream_headers).await {
+        Ok(result) => result,
+        Err(error) => {
+            error!(request.id = %request_id, error = %error, "direct stream request failed");
+            return Err(error.into_response());
+        }
+    };
+    let latency = start.elapsed();
+
+    let StreamResult {
+        response,
+        final_url,
+        head_attempts,
+        get_attempts,
+        response_bytes,
+    } = stream_result;
+
+    span.record("upstream.url", &tracing::field::display(&final_url));
+
+    let status = response.status();
+    let response_bytes = response_bytes.unwrap_or_default();
+    let head_retries = head_attempts.saturating_sub(1);
+    let get_retries = get_attempts.saturating_sub(1);
+    let total_retries = head_retries + get_retries;
+    let latency_ms = latency.as_millis() as u64;
+
+    info!(
+        request.id = %request_id,
+        upstream.url = %final_url,
+        status = %status,
+        latency_ms,
+        retry.count.head = head_retries,
+        retry.count.get = get_retries,
+        retry.count.total = total_retries,
+        response.bytes = response_bytes,
+        "completed direct stream"
+    );
+
+    #[cfg(feature = "telemetry")]
+    {
+        metrics::counter!("sprox_requests_total", "route" => "direct_stream").increment(1);
+        metrics::histogram!(
+            "sprox_upstream_latency_seconds",
+            "route" => "direct_stream",
+        )
+        .record(latency.as_secs_f64());
+        metrics::counter!(
+            "sprox_bytes_streamed_total",
+            "route" => "direct_stream",
+        )
+        .increment(response_bytes);
+    }
+
+    Ok(response)
 }
 
 fn extract_api_password(headers: &HeaderMap, query: &DirectStreamQuery) -> Option<String> {
@@ -465,10 +531,11 @@ impl DirectStreamService {
         &self,
         url: Url,
         headers: ReqwestHeaderMap,
-    ) -> Result<Response<Body>, DirectStreamError> {
+    ) -> Result<StreamResult, DirectStreamError> {
         let head_outcome = self
             .send_with_redirects(Method::HEAD, url, headers.clone())
             .await?;
+        let head_attempts = head_outcome.attempts;
         let head_status = head_outcome.response.status();
 
         if !matches!(
@@ -481,6 +548,7 @@ impl DirectStreamService {
         let get_outcome = self
             .send_with_redirects(Method::GET, head_outcome.final_url, headers)
             .await?;
+        let get_attempts = get_outcome.attempts;
 
         validate_upstream_status(get_outcome.response.status())?;
 
@@ -547,6 +615,7 @@ impl DirectStreamService {
         }
 
         let known_length = get_outcome.response.content_length();
+        let response_bytes = known_length;
 
         match known_length {
             Some(length) => {
@@ -579,7 +648,13 @@ impl DirectStreamService {
         let mut response = Response::builder().status(status).body(body)?;
         *response.headers_mut() = response_headers;
 
-        Ok(response)
+        Ok(StreamResult {
+            response,
+            final_url: get_outcome.final_url,
+            head_attempts,
+            get_attempts,
+            response_bytes,
+        })
     }
 
     async fn send_with_redirects(
@@ -590,6 +665,7 @@ impl DirectStreamService {
     ) -> Result<RequestOutcome, DirectStreamError> {
         let mut current_url = url;
         let mut redirects = 0;
+        let mut total_attempts = 0;
 
         loop {
             self.validate_destination(&current_url).await?;
@@ -603,26 +679,29 @@ impl DirectStreamService {
                 .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
 
             let retry_policy = self.settings.retry().clone();
-            let response =
-                match retry::execute_with_retry(self.client.clone(), request, retry_policy).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        let budget_exhausted = error.is_budget_exhausted();
-                        let source = error.into_source();
-                        if let Some(ip) = extract_restricted_ip(&source) {
-                            return Err(DirectStreamError::DestinationAddressRestricted {
-                                url: current_url.to_string(),
-                                ip,
-                            });
-                        }
-
-                        if budget_exhausted {
-                            return Err(DirectStreamError::RetryBudgetExhausted { source });
-                        }
-
-                        return Err(DirectStreamError::UpstreamRequest { source });
+            let retry_outcome =
+                retry::execute_with_retry(self.client.clone(), request, retry_policy).await;
+            let attempts = retry_outcome.attempts();
+            total_attempts += attempts;
+            let response = match retry_outcome.into_result() {
+                Ok(response) => response,
+                Err(error) => {
+                    let budget_exhausted = error.is_budget_exhausted();
+                    let source = error.into_source();
+                    if let Some(ip) = extract_restricted_ip(&source) {
+                        return Err(DirectStreamError::DestinationAddressRestricted {
+                            url: current_url.to_string(),
+                            ip,
+                        });
                     }
-                };
+
+                    if budget_exhausted {
+                        return Err(DirectStreamError::RetryBudgetExhausted { source });
+                    }
+
+                    return Err(DirectStreamError::UpstreamRequest { source });
+                }
+            };
 
             if let Some(next_url) = self.extract_redirect(&current_url, &response)? {
                 redirects += 1;
@@ -639,6 +718,7 @@ impl DirectStreamService {
             return Ok(RequestOutcome {
                 response,
                 final_url: current_url,
+                attempts: total_attempts,
             });
         }
     }
@@ -714,6 +794,15 @@ impl DirectStreamService {
 struct RequestOutcome {
     response: reqwest::Response,
     final_url: Url,
+    attempts: u32,
+}
+
+struct StreamResult {
+    response: Response<Body>,
+    final_url: Url,
+    head_attempts: u32,
+    get_attempts: u32,
+    response_bytes: Option<u64>,
 }
 
 fn validate_upstream_status(status: reqwest::StatusCode) -> Result<(), DirectStreamError> {

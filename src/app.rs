@@ -65,12 +65,10 @@ pub fn build_router(state: AppState) -> Router {
     let router = router.route("/keys/clearkey", get(dash::clearkey_jwks));
 
     let router = router
+        .route("/metrics", get(prometheus_metrics))
         .fallback(proxy_fallback)
         .with_state(state)
         .layer(rate_limit_layer);
-
-    #[cfg(feature = "telemetry")]
-    let router = router.route("/metrics", get(prometheus_metrics));
 
     #[cfg(feature = "telemetry")]
     let router = router.layer({
@@ -427,23 +425,30 @@ fn map_proxy_error(error: ProxyError) -> axum::http::Response<Body> {
     (status, message).into_response()
 }
 
-#[cfg(feature = "telemetry")]
 async fn prometheus_metrics() -> impl IntoResponse {
-    match crate::scrape_metrics() {
-        Some(body) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/plain; version=0.0.4"),
-            )],
-            body,
-        )
-            .into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "metrics recorder unavailable",
-        )
-            .into_response(),
+    #[cfg(feature = "telemetry")]
+    {
+        match crate::scrape_metrics() {
+            Some(body) => (
+                StatusCode::OK,
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/plain; version=0.0.4"),
+                )],
+                body,
+            )
+                .into_response(),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metrics recorder unavailable",
+            )
+                .into_response(),
+        }
+    }
+
+    #[cfg(not(feature = "telemetry"))]
+    {
+        (StatusCode::NOT_IMPLEMENTED, "telemetry feature disabled").into_response()
     }
 }
 
