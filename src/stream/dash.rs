@@ -22,7 +22,7 @@ use crate::security::SecurityError;
 #[cfg(feature = "drm")]
 use crate::{
     security,
-    state::{AppState, SecretValue},
+    state::{AppState, SecretsStore},
 };
 #[cfg(feature = "drm")]
 use serde::{Deserialize, Serialize};
@@ -171,7 +171,8 @@ pub async fn clearkey_jwks(
 
     let signing_secret = {
         let secrets = state.secrets();
-        let secrets_guard = secrets.read().await;
+        let mut secrets_guard = secrets.write().await;
+        secrets_guard.purge_expired();
         let Some(secret) = secrets_guard.get(CLEARKEY_SIGNING_SECRET) else {
             return Err(DashError::MissingSigningSecret);
         };
@@ -186,8 +187,9 @@ pub async fn clearkey_jwks(
 
     let (key_name, key_value) = {
         let secrets = state.secrets();
-        let secrets_guard = secrets.read().await;
-        find_key_entry(&secrets_guard, &query.kid, &kid_bytes)?
+        let mut secrets_guard = secrets.write().await;
+        secrets_guard.purge_expired();
+        find_key_entry(&mut secrets_guard, &query.kid, &kid_bytes)?
     };
 
     let key_bytes = decode_key_material(&key_value, &key_name)?;
@@ -276,7 +278,7 @@ fn decode_kid(kid: &str) -> Result<[u8; 16], DashError> {
 
 #[cfg(feature = "drm")]
 fn find_key_entry(
-    secrets: &std::collections::HashMap<String, SecretValue>,
+    secrets: &mut SecretsStore,
     provided_kid: &str,
     kid_bytes: &[u8; 16],
 ) -> Result<(String, String), DashError> {
@@ -419,7 +421,8 @@ mod drm_tests {
     use std::fmt::Write;
     use tower::ServiceExt;
 
-    use crate::state::{AppState, SecretValue};
+    use crate::state::{AppState, SecretValue, SensitiveLoggingConfig};
+    use std::time::Duration;
 
     #[tokio::test]
     async fn clearkey_handler_returns_jwk() {
@@ -483,6 +486,104 @@ mod drm_tests {
         let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(parsed["keys"][0]["kid"], kid_b64);
         assert_eq!(parsed["keys"][0]["k"], key_b64);
+    }
+
+    #[tokio::test]
+    async fn clearkey_handler_purges_expired_entries() {
+        let kid_uuid = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174001").unwrap();
+        let signing_secret = "super-secret".to_string();
+        let key_b64 = URL_SAFE_NO_PAD.encode([0u8; 16]);
+
+        let state = AppState::new();
+        {
+            let secrets_handle = state.secrets();
+            let mut secrets = secrets_handle.write().await;
+            secrets.insert(
+                CLEARKEY_SIGNING_SECRET.to_string(),
+                SecretValue {
+                    value: signing_secret.clone(),
+                },
+            );
+            secrets.insert_with_ttl(
+                format!("{}{}", CLEARKEY_SECRET_PREFIX, kid_uuid.hyphenated()),
+                SecretValue {
+                    value: key_b64.clone(),
+                },
+                Duration::from_millis(0),
+            );
+        }
+
+        let app = axum::Router::new()
+            .route("/keys/clearkey", axum::routing::get(clearkey_jwks))
+            .with_state(state.clone());
+
+        let unsigned_url = Url::parse(&format!(
+            "https://example.com/keys/clearkey?kid={}",
+            kid_uuid.hyphenated()
+        ))
+        .unwrap();
+        let signed_url =
+            security::sign_url(&unsigned_url, signing_secret.as_bytes(), SIGNATURE_PARAM)
+                .expect("signing should succeed");
+        let request_uri = format!(
+            "{}?{}",
+            signed_url.path(),
+            signed_url.query().expect("query expected"),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(request_uri)
+                    .header("host", "example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let secrets_handle = state.secrets();
+        let mut secrets = secrets_handle.write().await;
+        assert!(secrets
+            .get(&format!(
+                "{}{}",
+                CLEARKEY_SECRET_PREFIX,
+                kid_uuid.hyphenated()
+            ))
+            .is_none());
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn clearkey_logging_defaults_to_redaction() {
+        use axum::http::Uri;
+
+        let uri: Uri = "/keys/clearkey?kid=test-kid&sig=test-sig"
+            .parse()
+            .expect("uri should parse");
+        let sanitized = crate::app::sanitize_request_uri(&uri, &SensitiveLoggingConfig::default());
+
+        assert!(!sanitized.contains("test-kid"));
+        assert!(!sanitized.contains("test-sig"));
+        assert!(sanitized.contains("<redacted>"));
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn clearkey_logging_respects_redaction_toggle() {
+        use axum::http::Uri;
+
+        let uri: Uri = "/keys/clearkey?kid=test-kid&sig=test-sig"
+            .parse()
+            .expect("uri should parse");
+        let mut config = SensitiveLoggingConfig::default();
+        config = config.with_redact_sensitive_queries(true);
+        let sanitized = crate::app::sanitize_request_uri(&uri, &config);
+
+        assert!(sanitized.contains("test-kid"));
+        assert!(sanitized.contains("test-sig"));
     }
 
     #[test]

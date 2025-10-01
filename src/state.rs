@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobMatcher};
 use once_cell::sync::OnceCell;
@@ -241,6 +241,25 @@ pub struct SecretValue {
     pub value: String,
 }
 
+#[derive(Clone, Debug)]
+struct SecretEntry {
+    value: SecretValue,
+    expires_at: Instant,
+}
+
+impl SecretEntry {
+    fn new(value: SecretValue, ttl: Duration) -> Self {
+        let now = Instant::now();
+        let expires_at = now.checked_add(ttl).unwrap_or(now);
+
+        Self { value, expires_at }
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        now >= self.expires_at
+    }
+}
+
 /// In-memory cache used to store client registrations.
 pub type ClientsCache = HashMap<ClientId, ClientMetadata>;
 
@@ -248,7 +267,90 @@ pub type ClientsCache = HashMap<ClientId, ClientMetadata>;
 pub type RoutingTable = HashMap<RouteId, RouteTarget>;
 
 /// In-memory secret store shared across the application.
-pub type SecretsStore = HashMap<SecretName, SecretValue>;
+#[derive(Clone, Debug)]
+pub struct SecretsStore {
+    entries: HashMap<SecretName, SecretEntry>,
+    default_ttl: Duration,
+}
+
+impl SecretsStore {
+    /// Creates a new [`SecretsStore`] with the provided default TTL.
+    pub fn new(default_ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            default_ttl,
+        }
+    }
+
+    /// Returns the default TTL applied to new entries.
+    pub fn default_ttl(&self) -> Duration {
+        self.default_ttl
+    }
+
+    /// Inserts a secret into the store using the configured default TTL.
+    pub fn insert(&mut self, name: SecretName, value: SecretValue) -> Option<SecretValue> {
+        self.insert_with_ttl(name, value, self.default_ttl)
+    }
+
+    /// Inserts a secret with an explicit TTL overriding the store default.
+    pub fn insert_with_ttl(
+        &mut self,
+        name: SecretName,
+        value: SecretValue,
+        ttl: Duration,
+    ) -> Option<SecretValue> {
+        let entry = SecretEntry::new(value, ttl);
+        self.entries
+            .insert(name, entry)
+            .map(|previous| previous.value)
+    }
+
+    /// Retrieves a secret by name, removing it if the TTL has elapsed.
+    pub fn get(&mut self, name: &str) -> Option<&SecretValue> {
+        let now = Instant::now();
+        let should_remove = match self.entries.get(name) {
+            Some(entry) => entry.is_expired(now),
+            None => return None,
+        };
+
+        if should_remove {
+            self.entries.remove(name);
+            return None;
+        }
+
+        self.entries.get(name).map(|entry| &entry.value)
+    }
+
+    /// Returns the list of active secret identifiers, purging expired entries.
+    pub fn keys(&mut self) -> Vec<SecretName> {
+        self.purge_expired();
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Removes any entries whose TTL has elapsed.
+    pub fn purge_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| !entry.is_expired(now));
+    }
+}
+
+impl Default for SecretsStore {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300))
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for SecretsStore {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        Err(serde::ser::Error::custom(
+            "SecretsStore cannot be serialized; persist secrets in a dedicated vault",
+        ))
+    }
+}
 
 /// Shared handle to the client cache protected by an asynchronous lock.
 pub type SharedClientsCache = Arc<RwLock<ClientsCache>>;
@@ -258,6 +360,38 @@ pub type SharedRoutingTable = Arc<RwLock<RoutingTable>>;
 
 /// Shared handle to the secret store protected by an asynchronous lock.
 pub type SharedSecretsStore = Arc<RwLock<SecretsStore>>;
+
+/// Configuration toggles governing how sensitive data is logged.
+#[derive(Clone, Debug, Default)]
+pub struct SensitiveLoggingConfig {
+    log_sensitive_headers: bool,
+    redact_sensitive_queries: bool,
+}
+
+impl SensitiveLoggingConfig {
+    /// Returns true when sensitive headers should be logged verbatim.
+    pub fn log_sensitive_headers(&self) -> bool {
+        self.log_sensitive_headers
+    }
+
+    /// Returns true when redaction should be disabled for sensitive queries.
+    ///
+    /// When this value is `false` (the default), DRM-related routes will have
+    /// their sensitive query parameters redacted from trace output.
+    pub fn redact_sensitive_queries(&self) -> bool {
+        self.redact_sensitive_queries
+    }
+
+    pub fn with_log_sensitive_headers(mut self, enabled: bool) -> Self {
+        self.log_sensitive_headers = enabled;
+        self
+    }
+
+    pub fn with_redact_sensitive_queries(mut self, disabled: bool) -> Self {
+        self.redact_sensitive_queries = disabled;
+        self
+    }
+}
 
 /// Shared handle to the compiled routing engine used when selecting routes.
 pub type SharedRoutingEngine = Arc<RoutingEngine>;
@@ -418,6 +552,16 @@ impl From<crate::config::RetryBackoffConfig> for RetryBackoff {
 impl From<crate::config::RetryBudgetConfig> for RetryBudget {
     fn from(value: crate::config::RetryBudgetConfig) -> Self {
         RetryBudget::new(value.ttl, value.min_per_sec, value.retry_ratio)
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::SensitiveLoggingConfig> for SensitiveLoggingConfig {
+    fn from(value: crate::config::SensitiveLoggingConfig) -> Self {
+        Self {
+            log_sensitive_headers: value.log_sensitive_headers,
+            redact_sensitive_queries: value.redact_sensitive_queries,
+        }
     }
 }
 
@@ -612,6 +756,7 @@ pub struct AppState {
     routing_engine: SharedRoutingEngine,
     http_client: Client,
     direct_stream: Option<DirectStreamState>,
+    sensitive_logging: SensitiveLoggingConfig,
 }
 
 impl AppState {
@@ -637,6 +782,7 @@ impl AppState {
             routing_engine,
             http_client: Client::new(),
             direct_stream: None,
+            sensitive_logging: SensitiveLoggingConfig::default(),
         }
     }
 
@@ -653,6 +799,11 @@ impl AppState {
     /// Returns a clone of the shared secrets store handle.
     pub fn secrets(&self) -> SharedSecretsStore {
         Arc::clone(&self.secrets)
+    }
+
+    /// Returns the configured logging redaction settings.
+    pub fn sensitive_logging(&self) -> &SensitiveLoggingConfig {
+        &self.sensitive_logging
     }
 
     /// Returns a clone of the compiled routing engine handle.
@@ -673,6 +824,12 @@ impl AppState {
     /// Applies a direct stream configuration to the state.
     pub fn with_direct_stream_settings(mut self, settings: DirectStreamSettings) -> Self {
         self.direct_stream = Some(DirectStreamState::new(settings));
+        self
+    }
+
+    /// Applies sensitive logging configuration.
+    pub fn with_sensitive_logging(mut self, config: SensitiveLoggingConfig) -> Self {
+        self.sensitive_logging = config;
         self
     }
 
@@ -737,7 +894,7 @@ impl Default for AppState {
         Self {
             clients_cache: Arc::new(RwLock::new(HashMap::new())),
             routing_table: Arc::new(RwLock::new(HashMap::new())),
-            secrets: Arc::new(RwLock::new(HashMap::new())),
+            secrets: Arc::new(RwLock::new(SecretsStore::default())),
             rate_limit: RateLimitConfig::default(),
             routing_engine: Arc::new(
                 RoutingEngine::new(Vec::new())
@@ -745,6 +902,7 @@ impl Default for AppState {
             ),
             http_client: Client::new(),
             direct_stream: None,
+            sensitive_logging: SensitiveLoggingConfig::default(),
         }
     }
 }
@@ -794,8 +952,11 @@ mod tests {
         );
 
         let secrets_handle = state.secrets();
-        let secrets = secrets_handle.read().await;
-        assert_eq!(secrets["api_key"].value, "super-secret");
+        let mut secrets = secrets_handle.write().await;
+        assert_eq!(
+            secrets.get("api_key").map(|secret| secret.value.as_str()),
+            Some("super-secret"),
+        );
     }
 
     #[test]

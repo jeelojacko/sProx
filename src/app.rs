@@ -33,7 +33,7 @@ use tracing::Level;
 use crate::stream::dash;
 use crate::{
     proxy::{self, ProxyError},
-    state::{AppState, RateLimitConfig},
+    state::{AppState, RateLimitConfig, SensitiveLoggingConfig},
     stream::direct::handle_proxy_stream,
 };
 use futures::future::BoxFuture;
@@ -73,16 +73,14 @@ pub fn build_router(state: AppState) -> Router {
     let router = router.layer(
         TraceLayer::new_for_http()
             .make_span_with(|request: &Request<Body>| {
-                let user_agent = request
-                    .headers()
-                    .get(header::USER_AGENT)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("-");
+                let state = request.extensions().get::<AppState>();
+                let (user_agent, uri) =
+                    span_fields(request, state.map(AppState::sensitive_logging));
 
                 tracing::info_span!(
                     "http.request",
                     method = %request.method(),
-                    uri = %request.uri(),
+                    uri = %uri,
                     version = ?request.version(),
                     user_agent = %user_agent,
                 )
@@ -280,8 +278,8 @@ impl futures::Stream for SpeedtestStream {
 /// Lists the keys currently registered in the application's secret store.
 async fn list_registered_keys(State(state): State<AppState>) -> impl IntoResponse {
     let secrets_store = state.secrets();
-    let secrets = secrets_store.read().await;
-    let mut keys: Vec<_> = secrets.keys().cloned().collect();
+    let mut secrets = secrets_store.write().await;
+    let mut keys = secrets.keys();
     keys.sort();
 
     if keys.is_empty() {
@@ -292,6 +290,91 @@ async fn list_registered_keys(State(state): State<AppState>) -> impl IntoRespons
     } else {
         let response = format!("Registered keys: {}", keys.join(", "));
         (StatusCode::OK, response)
+    }
+}
+
+#[cfg(feature = "telemetry")]
+fn span_fields(
+    request: &Request<Body>,
+    logging: Option<&SensitiveLoggingConfig>,
+) -> (String, String) {
+    let settings = logging.cloned().unwrap_or_default();
+    let user_agent = if settings.log_sensitive_headers() {
+        request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    } else {
+        "-".to_string()
+    };
+
+    let uri = sanitize_request_uri(request.uri(), &settings);
+
+    (user_agent, uri)
+}
+
+#[cfg(not(feature = "telemetry"))]
+fn span_fields(
+    _request: &Request<Body>,
+    _logging: Option<&SensitiveLoggingConfig>,
+) -> (String, String) {
+    (String::from("-"), String::from(""))
+}
+
+#[cfg(feature = "telemetry")]
+pub(crate) fn sanitize_request_uri(
+    uri: &axum::http::Uri,
+    settings: &SensitiveLoggingConfig,
+) -> String {
+    let should_redact = !settings.redact_sensitive_queries();
+
+    if should_redact && is_drm_route(uri) {
+        redact_drm_uri(uri)
+    } else {
+        uri.to_string()
+    }
+}
+
+#[cfg(feature = "telemetry")]
+fn redact_drm_uri(uri: &axum::http::Uri) -> String {
+    let mut redacted = uri.path().to_string();
+
+    if let Some(query) = uri.query() {
+        let sanitized: Vec<String> = query
+            .split('&')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| {
+                let mut parts = segment.splitn(2, '=');
+                let key = parts.next().unwrap_or("");
+                match key {
+                    "kid" | "sig" => format!("{key}=<redacted>"),
+                    _ => segment.to_string(),
+                }
+            })
+            .collect();
+
+        if !sanitized.is_empty() {
+            redacted.push('?');
+            redacted.push_str(&sanitized.join("&"));
+        }
+    }
+
+    redacted
+}
+
+#[cfg(feature = "telemetry")]
+fn is_drm_route(uri: &axum::http::Uri) -> bool {
+    #[cfg(feature = "drm")]
+    {
+        uri.path().starts_with("/keys/clearkey")
+    }
+
+    #[cfg(not(feature = "drm"))]
+    {
+        let _ = uri;
+        false
     }
 }
 

@@ -15,6 +15,8 @@ use crate::routing::RouteProtocol;
 pub struct Config {
     pub direct_stream: Option<DirectStreamConfig>,
     pub routes: Vec<RouteConfig>,
+    pub secrets: SecretsConfig,
+    pub sensitive_logging: SensitiveLoggingConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,25 @@ pub struct DirectStreamConfig {
     pub response_buffer_bytes: usize,
     pub allowlist: DirectStreamAllowlist,
     pub retry: RetryConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretsConfig {
+    pub default_ttl: Duration,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl: Duration::from_secs(300),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SensitiveLoggingConfig {
+    pub log_sensitive_headers: bool,
+    pub redact_sensitive_queries: bool,
 }
 
 impl DirectStreamConfig {
@@ -247,6 +268,10 @@ struct RawConfig {
     #[serde(default)]
     direct_stream: Option<RawDirectStream>,
     routes: Vec<RawRoute>,
+    #[serde(default)]
+    secrets: Option<RawSecrets>,
+    #[serde(default)]
+    sensitive_logging: Option<RawSensitiveLogging>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -267,6 +292,20 @@ struct RawDirectStream {
     allowlist: Vec<RawDirectStreamAllowRule>,
     #[serde(default)]
     retry: Option<RawRetry>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawSecrets {
+    #[serde(default)]
+    default_ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawSensitiveLogging {
+    #[serde(default)]
+    log_sensitive_headers: Option<bool>,
+    #[serde(default)]
+    redact_sensitive_queries: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,10 +439,14 @@ impl TryFrom<RawConfig> for Config {
         }
 
         let direct_stream = parse_direct_stream(raw.direct_stream)?;
+        let secrets = parse_secrets(raw.secrets)?;
+        let sensitive_logging = parse_sensitive_logging(raw.sensitive_logging)?;
 
         Ok(Self {
             direct_stream,
             routes,
+            secrets,
+            sensitive_logging,
         })
     }
 }
@@ -488,6 +531,31 @@ fn parse_direct_stream(
     Ok(parsed)
 }
 
+fn parse_secrets(raw: Option<RawSecrets>) -> Result<SecretsConfig, ConfigError> {
+    match raw {
+        Some(raw) => raw.try_into_config("secrets"),
+        None => Ok(SecretsConfig::default()),
+    }
+}
+
+fn parse_sensitive_logging(
+    raw: Option<RawSensitiveLogging>,
+) -> Result<SensitiveLoggingConfig, ConfigError> {
+    let mut config = SensitiveLoggingConfig::default();
+
+    if let Some(raw) = raw {
+        if let Some(value) = raw.log_sensitive_headers {
+            config.log_sensitive_headers = value;
+        }
+
+        if let Some(value) = raw.redact_sensitive_queries {
+            config.redact_sensitive_queries = value;
+        }
+    }
+
+    Ok(config)
+}
+
 impl RawRoute {
     fn try_into_context(self, context: String) -> Result<RouteConfig, ConfigError> {
         if self.id.trim().is_empty() {
@@ -565,6 +633,19 @@ impl RawDirectStream {
 
         config.allowlist = parse_direct_stream_allowlist(self.allowlist, context)?;
         config.retry = parse_retry(self.retry, format!("{context}.retry"))?;
+
+        Ok(config)
+    }
+}
+
+impl RawSecrets {
+    fn try_into_config(self, context: &str) -> Result<SecretsConfig, ConfigError> {
+        let mut config = SecretsConfig::default();
+
+        if let Some(ttl_secs) = self.default_ttl_secs {
+            config.default_ttl =
+                duration_from_secs(ttl_secs, format!("{context}.default_ttl_secs"))?;
+        }
 
         Ok(config)
     }
@@ -943,6 +1024,17 @@ fn optional_duration_from_millis(
     }
 }
 
+fn duration_from_secs(value: u64, context: String) -> Result<Duration, ConfigError> {
+    if value == 0 {
+        return Err(validation_error(
+            context,
+            "duration must be greater than zero",
+        ));
+    }
+
+    Ok(Duration::from_secs(value))
+}
+
 fn duration_from_millis(value: u64, context: String) -> Result<Duration, ConfigError> {
     if value == 0 {
         return Err(validation_error(
@@ -1059,6 +1151,9 @@ mod tests {
             direct.response_buffer_bytes,
             DirectStreamConfig::DEFAULT_RESPONSE_BUFFER_BYTES
         );
+        assert_eq!(config.secrets.default_ttl, Duration::from_secs(300));
+        assert!(!config.sensitive_logging.log_sensitive_headers);
+        assert!(!config.sensitive_logging.redact_sensitive_queries);
     }
 
     #[test]
@@ -1084,6 +1179,8 @@ mod tests {
                 },
                 hls: None,
             }],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1100,6 +1197,8 @@ mod tests {
         let raw = RawConfig {
             direct_stream: None,
             routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1133,6 +1232,8 @@ mod tests {
                 }),
             }),
             routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1175,6 +1276,8 @@ mod tests {
                 ..Default::default()
             }),
             routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1201,6 +1304,8 @@ mod tests {
                 ..Default::default()
             }),
             routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1230,6 +1335,8 @@ mod tests {
         let raw = RawConfig {
             direct_stream: None,
             routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1245,5 +1352,57 @@ mod tests {
         env::remove_var("SPROX_DIRECT_API_PASSWORD");
         env::remove_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS");
         env::remove_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES");
+    }
+
+    #[test]
+    fn secrets_configuration_respects_custom_ttl() {
+        let raw = RawConfig {
+            direct_stream: None,
+            routes: vec![sample_route()],
+            secrets: Some(RawSecrets {
+                default_ttl_secs: Some(120),
+            }),
+            sensitive_logging: None,
+        };
+
+        let config = Config::try_from(raw).expect("configuration should load");
+        assert_eq!(config.secrets.default_ttl, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn secrets_configuration_rejects_zero_ttl() {
+        let raw = RawConfig {
+            direct_stream: None,
+            routes: vec![sample_route()],
+            secrets: Some(RawSecrets {
+                default_ttl_secs: Some(0),
+            }),
+            sensitive_logging: None,
+        };
+
+        let err = Config::try_from(raw).expect_err("validation should fail");
+        match err {
+            ConfigError::Validation { context, .. } => {
+                assert_eq!(context, "secrets.default_ttl_secs");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sensitive_logging_configuration_parses_flags() {
+        let raw = RawConfig {
+            direct_stream: None,
+            routes: vec![sample_route()],
+            secrets: None,
+            sensitive_logging: Some(RawSensitiveLogging {
+                log_sensitive_headers: Some(true),
+                redact_sensitive_queries: Some(true),
+            }),
+        };
+
+        let config = Config::try_from(raw).expect("configuration should load");
+        assert!(config.sensitive_logging.log_sensitive_headers);
+        assert!(config.sensitive_logging.redact_sensitive_queries);
     }
 }
