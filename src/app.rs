@@ -29,11 +29,13 @@ use tower_http::LatencyUnit;
 #[cfg(feature = "telemetry")]
 use tracing::Level;
 
+#[cfg(test)]
+use crate::state::AppState;
 #[cfg(feature = "drm")]
 use crate::stream::dash;
 use crate::{
     proxy::{self, ProxyError},
-    state::{AppState, RateLimitConfig, SensitiveLoggingConfig},
+    state::{RateLimitConfig, SensitiveLoggingConfig, SharedAppState},
     stream::direct::handle_proxy_stream,
 };
 use futures::future::BoxFuture;
@@ -48,11 +50,12 @@ use tracing::error;
 /// implemented. Middlewares that are part of the final design, such as request
 /// tracing and rate limiting, are already attached so that the surrounding
 /// wiring can be validated ahead of time.
-pub fn build_router(state: AppState) -> Router {
-    let rate_limit_layer = RateLimitLayer::new(state.rate_limit_config());
+pub fn build_router(state: SharedAppState) -> Router {
+    let rate_limit_layer =
+        RateLimitLayer::new(state.with_current(|state| state.rate_limit_config()));
 
     #[cfg(feature = "telemetry")]
-    let sensitive_logging = state.sensitive_logging().clone();
+    let sensitive_logging = state.with_current(|state| state.sensitive_logging().clone());
 
     let router = Router::new()
         .route("/health", get(health_check))
@@ -277,8 +280,8 @@ impl futures::Stream for SpeedtestStream {
 }
 
 /// Lists the keys currently registered in the application's secret store.
-async fn list_registered_keys(State(state): State<AppState>) -> impl IntoResponse {
-    let secrets_store = state.secrets();
+async fn list_registered_keys(State(state): State<SharedAppState>) -> impl IntoResponse {
+    let secrets_store = state.with_current(|app| app.secrets());
     let mut secrets = secrets_store.write().await;
     let mut keys = secrets.keys();
     keys.sort();
@@ -382,7 +385,7 @@ fn is_drm_route(uri: &axum::http::Uri) -> bool {
 /// Catch-all proxy handler used for routes that have not been explicitly
 /// registered.
 async fn proxy_fallback(
-    State(state): State<AppState>,
+    State(state): State<SharedAppState>,
     request: Request<Body>,
 ) -> impl IntoResponse {
     #[cfg(feature = "telemetry")]
@@ -590,7 +593,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_route_returns_success() {
-        let app = build_router(AppState::new());
+        let app = build_router(SharedAppState::new(AppState::new()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -721,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn speedtest_streams_expected_payload() {
-        let app = build_router(AppState::new());
+        let app = build_router(SharedAppState::new(AppState::new()));
         let response = app
             .oneshot(
                 Request::builder()

@@ -1,8 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use globset::{Glob, GlobMatcher};
 use http::header::HeaderName;
 use once_cell::sync::OnceCell;
@@ -11,7 +15,8 @@ use tokio::sync::RwLock;
 use tower::retry::budget::Budget;
 use url::Url;
 
-use crate::routing::RoutingEngine;
+use crate::config::Config;
+use crate::routing::{PortRange, RouteDefinition, RoutingEngine};
 
 pub(crate) const DIRECT_STREAM_REQUEST_HEADER_ALLOWLIST: &[&str] = &[
     "accept",
@@ -839,6 +844,46 @@ pub struct AppState {
     sensitive_logging: SensitiveLoggingConfig,
 }
 
+/// Shared handle that allows the application state to be swapped atomically at runtime.
+#[derive(Clone, Debug)]
+pub struct SharedAppState {
+    inner: Arc<ArcSwap<AppState>>,
+}
+
+impl SharedAppState {
+    /// Wraps the provided [`AppState`] in a reloadable handle.
+    pub fn new(state: AppState) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(state)),
+        }
+    }
+
+    /// Returns a clone of the current [`AppState`] snapshot.
+    pub fn snapshot(&self) -> Arc<AppState> {
+        self.inner.load_full()
+    }
+
+    /// Replaces the current [`AppState`] with the provided instance.
+    pub fn replace(&self, next: AppState) {
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Executes the provided closure with a reference to the current [`AppState`].
+    pub fn with_current<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&AppState) -> R,
+    {
+        let snapshot = self.inner.load();
+        f(&snapshot)
+    }
+}
+
+impl From<AppState> for SharedAppState {
+    fn from(value: AppState) -> Self {
+        Self::new(value)
+    }
+}
+
 impl AppState {
     /// Constructs a new [`AppState`] using empty caches for each component.
     pub fn new() -> Self {
@@ -864,6 +909,85 @@ impl AppState {
             direct_stream: None,
             sensitive_logging: SensitiveLoggingConfig::default(),
         }
+    }
+
+    /// Constructs an [`AppState`] from the provided configuration.
+    pub fn from_config(config: &Config) -> Result<Self> {
+        let mut routing_table = HashMap::new();
+        let mut route_definitions = Vec::with_capacity(config.routes.len());
+        let socks5_override = env::var("SPROX_PROXY_URL")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+
+        for route in &config.routes {
+            let socks5 = if let Some(override_address) = socks5_override.as_ref() {
+                Some(Socks5Proxy {
+                    address: override_address.clone(),
+                    username: route.upstream.socks5.username.clone(),
+                    password: route.upstream.socks5.password.clone(),
+                })
+            } else if route.upstream.socks5.enabled {
+                route
+                    .upstream
+                    .socks5
+                    .address
+                    .as_ref()
+                    .map(|address| Socks5Proxy {
+                        address: address.clone(),
+                        username: route.upstream.socks5.username.clone(),
+                        password: route.upstream.socks5.password.clone(),
+                    })
+            } else {
+                None
+            };
+
+            let hls = route.hls.as_ref().map(|hls| HlsOptions {
+                enabled: hls.enabled,
+                rewrite_playlist_urls: hls.rewrite_playlist_urls,
+                base_url: hls.base_url.clone(),
+                allow_insecure_segments: hls.allow_insecure_segments,
+            });
+
+            let target = RouteTarget {
+                upstream: route.upstream.origin.to_string(),
+                connect_timeout: route.upstream.connect_timeout,
+                read_timeout: route.upstream.read_timeout,
+                request_timeout: route.upstream.request_timeout,
+                tls_insecure_skip_verify: route.upstream.tls.insecure_skip_verify,
+                socks5,
+                hls,
+                retry: route.upstream.retry.clone().into(),
+                header_policy: route.upstream.header_policy.clone().into(),
+            };
+
+            routing_table.insert(route.id.clone(), target);
+
+            let port_range = PortRange::new(route.listen.port, route.listen.port)?;
+            route_definitions.push(RouteDefinition {
+                id: route.id.clone(),
+                host_patterns: route.host_patterns.clone(),
+                protocols: route.protocols.clone(),
+                ports: vec![port_range],
+            });
+        }
+
+        let routing_engine = Arc::new(RoutingEngine::new(route_definitions)?);
+
+        let mut state = AppState::with_components(
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(routing_table)),
+            Arc::new(RwLock::new(SecretsStore::new(config.secrets.default_ttl))),
+            routing_engine,
+        );
+
+        if let Some(direct_stream) = config.direct_stream.clone() {
+            state = state.with_direct_stream_settings(direct_stream.into());
+        }
+
+        state = state.with_sensitive_logging(config.sensitive_logging.clone().into());
+
+        Ok(state)
     }
 
     /// Returns a clone of the shared clients cache handle.
@@ -985,6 +1109,21 @@ impl Default for AppState {
             sensitive_logging: SensitiveLoggingConfig::default(),
         }
     }
+}
+
+/// Reloads application state from the provided configuration path.
+pub fn reload_app_state_from_path(path: impl AsRef<Path>, state: &SharedAppState) -> Result<()> {
+    let path = path.as_ref();
+    let config = Config::load_from_path(path)
+        .with_context(|| format!("failed to load configuration from `{}`", path.display()))?;
+    let next_state = AppState::from_config(&config).with_context(|| {
+        format!(
+            "failed to rebuild application state from `{}`",
+            path.display()
+        )
+    })?;
+    state.replace(next_state);
+    Ok(())
 }
 
 #[cfg(test)]

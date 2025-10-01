@@ -1,41 +1,84 @@
 use std::{
-    collections::HashMap,
     env,
     io::ErrorKind,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 
 use sProx::{
     app,
     config::{Config, ListenerConfig},
-    routing::{PortRange, RouteDefinition, RoutingEngine},
-    state::{AppState, HlsOptions, RouteTarget, SecretsStore, Socks5Proxy},
+    state::{reload_app_state_from_path, AppState, SharedAppState},
 };
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::net::TcpListener;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "sprox",
+    about = "Streaming proxy service",
+    version,
+    propagate_version = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Validate configuration files without starting the server.
+    Validate {
+        /// Directory containing the proxy configuration files.
+        #[arg(
+            short = 'c',
+            long = "config",
+            value_name = "DIR",
+            default_value = "config"
+        )]
+        config_dir: PathBuf,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    load_env_file()?;
+    let cli = Cli::parse();
 
+    load_env_file()?;
     sProx::init()?;
 
+    match cli.command {
+        Some(Command::Validate { config_dir }) => {
+            validate_config_dir(&config_dir)?;
+            Ok(())
+        }
+        None => run_server().await,
+    }
+}
+
+async fn run_server() -> Result<()> {
     let config_path = env::var("SPROX_CONFIG").unwrap_or_else(|_| "config/routes.yaml".into());
-    let config = Config::load_from_path(&config_path)
-        .with_context(|| format!("failed to load configuration from `{config_path}`"))?;
+    let config_path = PathBuf::from(config_path);
+    let config = Config::load_from_path(&config_path).with_context(|| {
+        format!(
+            "failed to load configuration from `{}`",
+            config_path.display()
+        )
+    })?;
 
     let listener = primary_listener(&config)
         .context("configuration must define at least one route to determine listener address")?;
     let addr = resolve_listener_addr(listener)
         .context("failed to resolve listener address from configuration")?;
 
-    let state =
-        build_app_state(&config).context("failed to build application state from configuration")?;
-    let router = app::build_router(state);
+    let app_state = AppState::from_config(&config)
+        .context("failed to build application state from configuration")?;
+    let shared_state = SharedAppState::new(app_state);
+    let router = app::build_router(shared_state.clone());
 
-    tracing::info!(path = %config_path, %addr, "starting sProx server");
+    tracing::info!(path = %config_path.display(), %addr, "starting sProx server");
 
     let listener = TcpListener::bind(addr)
         .await
@@ -44,6 +87,12 @@ async fn main() -> Result<()> {
         .local_addr()
         .with_context(|| "failed to determine listener address")?;
     tracing::info!(%local_addr, "sProx listening");
+
+    #[cfg(unix)]
+    tokio::spawn(watch_for_config_reloads(
+        config_path.clone(),
+        shared_state.clone(),
+    ));
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
@@ -55,82 +104,50 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_app_state(config: &Config) -> Result<AppState> {
-    let mut routing_table = HashMap::new();
-    let mut route_definitions = Vec::with_capacity(config.routes.len());
-    let socks5_override = env::var("SPROX_PROXY_URL")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+fn validate_config_dir(dir: &Path) -> Result<()> {
+    let config_path = dir.join("routes.yaml");
+    let config = Config::load_from_path(&config_path).with_context(|| {
+        format!(
+            "failed to load configuration from `{}`",
+            config_path.display()
+        )
+    })?;
 
-    for route in &config.routes {
-        let socks5 = if let Some(override_address) = socks5_override.as_ref() {
-            Some(Socks5Proxy {
-                address: override_address.clone(),
-                username: route.upstream.socks5.username.clone(),
-                password: route.upstream.socks5.password.clone(),
-            })
-        } else if route.upstream.socks5.enabled {
-            route
-                .upstream
-                .socks5
-                .address
-                .as_ref()
-                .map(|address| Socks5Proxy {
-                    address: address.clone(),
-                    username: route.upstream.socks5.username.clone(),
-                    password: route.upstream.socks5.password.clone(),
-                })
-        } else {
-            None
-        };
+    AppState::from_config(&config).with_context(|| {
+        format!(
+            "configuration `{}` failed validation",
+            config_path.display()
+        )
+    })?;
 
-        let hls = route.hls.as_ref().map(|hls| HlsOptions {
-            enabled: hls.enabled,
-            rewrite_playlist_urls: hls.rewrite_playlist_urls,
-            base_url: hls.base_url.clone(),
-            allow_insecure_segments: hls.allow_insecure_segments,
-        });
+    println!("configuration at `{}` is valid", config_path.display());
 
-        let target = RouteTarget {
-            upstream: route.upstream.origin.to_string(),
-            connect_timeout: route.upstream.connect_timeout,
-            read_timeout: route.upstream.read_timeout,
-            request_timeout: route.upstream.request_timeout,
-            tls_insecure_skip_verify: route.upstream.tls.insecure_skip_verify,
-            socks5,
-            hls,
-            retry: route.upstream.retry.clone().into(),
-            header_policy: route.upstream.header_policy.clone().into(),
-        };
+    Ok(())
+}
 
-        routing_table.insert(route.id.clone(), target);
+#[cfg(unix)]
+async fn watch_for_config_reloads(config_path: PathBuf, state: SharedAppState) {
+    use tokio::signal::unix::{signal, SignalKind};
 
-        let port_range = PortRange::new(route.listen.port, route.listen.port)?;
-        route_definitions.push(RouteDefinition {
-            id: route.id.clone(),
-            host_patterns: route.host_patterns.clone(),
-            protocols: route.protocols.clone(),
-            ports: vec![port_range],
-        });
+    let mut signals = match signal(SignalKind::hangup()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::error!(%error, "failed to initialise SIGHUP watcher");
+            return;
+        }
+    };
+
+    while signals.recv().await.is_some() {
+        tracing::info!(path = %config_path.display(), "received SIGHUP; reloading configuration");
+        match reload_app_state_from_path(&config_path, &state) {
+            Ok(_) => tracing::info!(path = %config_path.display(), "configuration reload complete"),
+            Err(error) => tracing::error!(
+                path = %config_path.display(),
+                error = ?error,
+                "failed to reload configuration; retaining previous state"
+            ),
+        }
     }
-
-    let routing_engine = Arc::new(RoutingEngine::new(route_definitions)?);
-
-    let mut state = AppState::with_components(
-        Arc::new(RwLock::new(HashMap::new())),
-        Arc::new(RwLock::new(routing_table)),
-        Arc::new(RwLock::new(SecretsStore::new(config.secrets.default_ttl))),
-        routing_engine,
-    );
-
-    if let Some(direct_stream) = config.direct_stream.clone() {
-        state = state.with_direct_stream_settings(direct_stream.into());
-    }
-
-    state = state.with_sensitive_logging(config.sensitive_logging.clone().into());
-
-    Ok(state)
 }
 
 fn primary_listener(config: &Config) -> Option<&ListenerConfig> {

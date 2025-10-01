@@ -131,6 +131,20 @@ performance characteristics:
   - Monitor CPU utilisation of manifest processing routines; heavy transmuxing should be
     offloaded to dedicated media workers when possible.
 
+### Configuration validation and reloads
+
+- Use the built-in CLI to validate configuration bundles before deploying. Running
+  `cargo run -- validate -c config` (or the installed binary `sprox validate -c <dir>`) reads
+  `<dir>/routes.yaml` with the same loader used at runtime and reports any syntax or
+  semantic validation errors without starting the server.
+- The runtime watches for `SIGHUP` on Unix targets. Sending `kill -HUP <pid>` forces sProx
+  to reload the configuration from disk, rebuild the application state, and atomically
+  swap it into the running server. If validation fails the previous configuration is
+  retained, with failures logged to aid debugging.
+- When the `SPROX_CONFIG` environment variable is set the daemon and the validation
+  command both honour it, allowing alternate configuration directories or files to be
+  tested and reloaded.
+
 Further operational playbooks (disaster recovery, observability, canary rollouts) will be
 added as the implementation matures. For interim guidance consult
 [`docs/operational-notes.md`](docs/operational-notes.md).
