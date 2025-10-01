@@ -147,22 +147,70 @@ fn rewrite_reference(
     }
 
     let mut new_url = base_url.clone();
-    let resolved_path = resolved.path().trim_start_matches('/');
-    let mut path_buf = new_url.path().trim_end_matches('/').to_string();
-    if !resolved_path.is_empty() {
-        if !path_buf.ends_with('/') {
-            path_buf.push('/');
+    let base_segments: Vec<String> = base_url
+        .path_segments()
+        .map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| segment.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut resolved_segments = resolved
+        .path_segments()
+        .map(|segments| normalize_path_segments(segments.filter(|segment| !segment.is_empty())))
+        .unwrap_or_default();
+
+    let mut combined = base_segments;
+    combined.append(&mut resolved_segments);
+
+    {
+        let mut path_builder = new_url
+            .path_segments_mut()
+            .expect("base URL should support path segments");
+        path_builder.clear();
+        for segment in &combined {
+            path_builder.push(segment);
         }
-        path_buf.push_str(resolved_path);
-    } else if path_buf.is_empty() {
-        path_buf.push('/');
     }
 
-    new_url.set_path(&path_buf);
+    if combined.is_empty() {
+        new_url.set_path("/");
+    }
+
+    let resolved_path = resolved.path();
+    let resolved_has_trailing_slash = resolved_path.ends_with('/') && !resolved_path.is_empty();
+    let base_had_trailing_slash = base_url.path().ends_with('/');
+    if resolved_has_trailing_slash || (resolved_path.is_empty() && base_had_trailing_slash) {
+        let mut path = new_url.path().to_string();
+        if !path.ends_with('/') {
+            path.push('/');
+            new_url.set_path(&path);
+        }
+    }
+
     new_url.set_query(resolved.query());
     new_url.set_fragment(resolved.fragment());
 
+    if !allow_insecure_segments && new_url.scheme() != "https" {
+        return Err(HlsError::InsecureOutput);
+    }
+
     Ok(new_url.to_string())
+}
+
+fn normalize_path_segments<'a>(segments: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for segment in segments {
+        match segment {
+            "." => continue,
+            ".." => {
+                normalized.pop();
+            }
+            other => normalized.push(other.to_string()),
+        }
+    }
+    normalized
 }
 
 fn resolve_reference(reference: &str, manifest_url: &Url) -> Result<Url, HlsError> {
@@ -192,6 +240,55 @@ mod tests {
         assert!(output.contains("https://cdn.example.com/hls/vod/segment1.ts"));
         assert!(output.contains("https://cdn.example.com/hls/vod/segment2.ts"));
         assert!(output.contains("https://cdn.example.com/hls/vod/keys/key.key"));
+    }
+
+    #[test]
+    fn rewrite_normalizes_parent_segments() {
+        let manifest = b"#EXTM3U\n#EXTINF:6.0,\n../video/../segment.ts\n";
+        let manifest_url = Url::parse("https://origin.example.com/path/sub/master.m3u8").unwrap();
+        let base_url = Url::parse("https://cdn.example.com/hls/").unwrap();
+
+        let rewritten =
+            rewrite_playlist(manifest, &manifest_url, Some(&base_url), true, true).unwrap();
+        let output = String::from_utf8(rewritten).unwrap();
+
+        assert!(output.contains("https://cdn.example.com/hls/path/segment.ts"));
+        assert!(!output.contains(".."));
+    }
+
+    #[test]
+    fn rewrite_preserves_key_iv_and_map_attributes() {
+        let manifest = b"#EXTM3U\n#EXT-X-MAP:URI=\"init/init.mp4\",BYTERANGE=\"720@0\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/key.key\",IV=0x1234\n";
+        let manifest_url = Url::parse("https://origin.example.com/vod/main.m3u8").unwrap();
+        let base_url = Url::parse("https://cdn.example.com/assets/").unwrap();
+
+        let rewritten =
+            rewrite_playlist(manifest, &manifest_url, Some(&base_url), true, true).unwrap();
+        let output = String::from_utf8(rewritten).unwrap();
+
+        assert!(output.contains(
+            "#EXT-X-MAP:URI=\"https://cdn.example.com/assets/vod/init/init.mp4\",BYTERANGE=\"720@0\""
+        ));
+        assert!(output.contains(
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"https://cdn.example.com/assets/vod/keys/key.key\",IV=0x1234"
+        ));
+    }
+
+    #[test]
+    fn rewrite_updates_variant_playlists_without_touching_metadata() {
+        let manifest = b"#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=1280000,AVERAGE-BANDWIDTH=1100000,CODECS=\"avc1.640029,mp4a.40.2\"\nvideo/main.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360\nhttp://origin.example.com/video/low.m3u8\n";
+        let manifest_url = Url::parse("https://origin.example.com/master.m3u8").unwrap();
+        let base_url = Url::parse("https://cdn.example.com/hls/").unwrap();
+
+        let rewritten =
+            rewrite_playlist(manifest, &manifest_url, Some(&base_url), true, false).unwrap();
+        let output = String::from_utf8(rewritten).unwrap();
+
+        assert!(output.contains("#EXT-X-STREAM-INF:BANDWIDTH=1280000,AVERAGE-BANDWIDTH=1100000,CODECS=\"avc1.640029,mp4a.40.2\""));
+        assert!(output.contains("#EXT-X-STREAM-INF:BANDWIDTH=640000,RESOLUTION=640x360"));
+        assert!(output.contains("https://cdn.example.com/hls/video/main.m3u8"));
+        assert!(output.contains("https://cdn.example.com/hls/video/low.m3u8"));
+        assert!(!output.contains("http://origin.example.com"));
     }
 
     #[test]
