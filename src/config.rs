@@ -1299,6 +1299,13 @@ mod tests {
 
     #[test]
     fn direct_stream_defaults_to_none_without_overrides() {
+        let _guard = env_lock().lock().expect("env lock should be acquired");
+
+        env::remove_var("SPROX_DIRECT_PROXY_URL");
+        env::remove_var("SPROX_DIRECT_API_PASSWORD");
+        env::remove_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS");
+        env::remove_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES");
+
         let raw = RawConfig {
             direct_stream: None,
             routes: vec![sample_route()],

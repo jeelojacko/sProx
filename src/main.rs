@@ -3,9 +3,10 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 use sProx::{
@@ -40,6 +41,19 @@ enum Command {
         )]
         config_dir: PathBuf,
     },
+    /// Perform an HTTP health check against a running sProx instance.
+    Healthcheck {
+        /// URL of the health endpoint to query.
+        #[arg(
+            long = "url",
+            value_name = "URL",
+            default_value = "http://127.0.0.1:8080/health"
+        )]
+        url: String,
+        /// Maximum duration to wait for the health endpoint response.
+        #[arg(long = "timeout", value_name = "SECONDS", default_value_t = 5)]
+        timeout_seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -54,6 +68,10 @@ async fn main() -> Result<()> {
             validate_config_dir(&config_dir)?;
             Ok(())
         }
+        Some(Command::Healthcheck {
+            url,
+            timeout_seconds,
+        }) => run_healthcheck(&url, timeout_seconds).await,
         None => run_server().await,
     }
 }
@@ -202,6 +220,28 @@ fn load_env_file() -> anyhow::Result<()> {
         Ok(_) => Ok(()),
         Err(dotenvy::Error::Io(err)) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err.into()),
+    }
+}
+
+async fn run_healthcheck(url: &str, timeout_seconds: u64) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .build()
+        .context("failed to build healthcheck HTTP client")?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to reach health endpoint at `{url}`"))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "health endpoint `{url}` returned status {}",
+            response.status()
+        ))
     }
 }
 
