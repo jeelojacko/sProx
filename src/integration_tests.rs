@@ -1,15 +1,18 @@
 use super::*;
 
-use std::{collections::HashMap, env, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, convert::Infallible, env, io, net::SocketAddr, sync::Arc, time::Duration,
+};
 
 use axum::{
-    body::Body as AxumBody,
+    body::{Body as AxumBody, Bytes as AxumBytes},
     extract::State as AxumState,
     http::{header, HeaderMap, HeaderValue, Method, StatusCode as AxumStatusCode, Uri},
     response::Response as AxumResponse,
     routing::get,
     Router,
 };
+use futures::stream;
 use reqwest::StatusCode;
 use tokio::{
     net::TcpListener,
@@ -262,6 +265,163 @@ async fn proxy_stream_respects_range_and_header_overrides() {
 }
 
 #[tokio::test]
+async fn proxy_stream_handles_if_range_semantics() {
+    let body = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let initial = client
+        .get(proxy_url.clone())
+        .send()
+        .await
+        .expect("initial request should succeed");
+
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial_headers = initial.headers().clone();
+    let etag = initial_headers
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .expect("upstream should include etag")
+        .to_string();
+    let last_modified = initial_headers
+        .get("last-modified")
+        .and_then(|value| value.to_str().ok())
+        .expect("upstream should include last-modified")
+        .to_string();
+    let initial_bytes = initial.bytes().await.expect("initial body should stream");
+    assert_eq!(initial_bytes, body);
+
+    let etag_response = client
+        .get(proxy_url.clone())
+        .header("range", "bytes=5-9")
+        .header("if-range", etag.clone())
+        .send()
+        .await
+        .expect("etag range request should succeed");
+    assert_eq!(etag_response.status(), StatusCode::PARTIAL_CONTENT);
+    let etag_headers = etag_response.headers().clone();
+    let expected_etag_range = format!("bytes 5-9/{}", body.len());
+    assert_eq!(
+        etag_headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_etag_range.as_str())
+    );
+    assert_eq!(
+        etag_headers
+            .get("content-length")
+            .and_then(|value| value.to_str().ok()),
+        Some("5")
+    );
+    assert_eq!(
+        etag_headers
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some(etag.as_str())
+    );
+    assert_eq!(
+        etag_headers
+            .get("last-modified")
+            .and_then(|value| value.to_str().ok()),
+        Some(last_modified.as_str())
+    );
+    let etag_bytes = etag_response
+        .bytes()
+        .await
+        .expect("etag range body should stream");
+    assert_eq!(etag_bytes, body[5..=9]);
+
+    let last_modified_response = client
+        .get(proxy_url.clone())
+        .header("range", "bytes=10-14")
+        .header("if-range", last_modified.clone())
+        .send()
+        .await
+        .expect("last-modified range request should succeed");
+    assert_eq!(last_modified_response.status(), StatusCode::PARTIAL_CONTENT);
+    let last_headers = last_modified_response.headers().clone();
+    let expected_last_range = format!("bytes 10-14/{}", body.len());
+    assert_eq!(
+        last_headers
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_last_range.as_str())
+    );
+    let last_bytes = last_modified_response
+        .bytes()
+        .await
+        .expect("last-modified range body should stream");
+    assert_eq!(last_bytes, body[10..=14]);
+
+    let mismatch_response = client
+        .get(proxy_url)
+        .header("range", "bytes=15-19")
+        .header("if-range", "invalid-token")
+        .send()
+        .await
+        .expect("mismatch range request should succeed");
+    assert_eq!(mismatch_response.status(), StatusCode::OK);
+    assert!(mismatch_response.headers().get("content-range").is_none());
+    let mismatch_bytes = mismatch_response
+        .bytes()
+        .await
+        .expect("mismatch range body should stream");
+    assert_eq!(mismatch_bytes, body);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_stream_streams_chunked_responses() {
+    let body = b"chunked-response-body-0123456789".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+    let upstream_state = context.upstream_state();
+    upstream_state.set_chunked(true).await;
+    upstream_state.set_chunk_size(3).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("chunked request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    let transfer_encoding = headers
+        .get("transfer-encoding")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase());
+    assert_eq!(transfer_encoding.as_deref(), Some("chunked"));
+    assert!(headers.get("content-length").is_none());
+    assert_eq!(
+        headers
+            .get("accept-ranges")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+    assert!(headers.get("etag").is_some());
+    assert!(headers.get("last-modified").is_some());
+
+    let bytes = response.bytes().await.expect("chunked body should stream");
+    assert_eq!(bytes, body);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
 async fn direct_stream_rejects_non_allowlisted_destination() {
     let context = spawn_stream_test_with_allowlist(b"abcdef".to_vec(), |_addr| {
         DirectStreamAllowlist { rules: Vec::new() }
@@ -397,6 +557,10 @@ impl StreamTestContext {
         Arc::clone(&self.upstream_log)
     }
 
+    fn upstream_state(&self) -> UpstreamState {
+        self.upstream_state.clone()
+    }
+
     async fn add_upstream_redirect(&self, path: &str, target: String) {
         self.upstream_state.add_redirect(path, target).await;
     }
@@ -496,6 +660,7 @@ struct UpstreamState {
     body: Arc<Vec<u8>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
     redirects: Arc<Mutex<HashMap<String, String>>>,
+    config: Arc<Mutex<TestUpstreamConfig>>,
 }
 
 impl UpstreamState {
@@ -504,6 +669,7 @@ impl UpstreamState {
             body: Arc::new(body),
             log: Arc::new(Mutex::new(Vec::new())),
             redirects: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(Mutex::new(TestUpstreamConfig::default())),
         }
     }
 
@@ -514,12 +680,39 @@ impl UpstreamState {
     async fn redirect_target(&self, path: &str) -> Option<String> {
         self.redirects.lock().await.get(path).cloned()
     }
+
+    async fn set_chunked(&self, chunked: bool) {
+        self.config.lock().await.chunked = chunked;
+    }
+
+    async fn set_chunk_size(&self, chunk_size: usize) {
+        self.config.lock().await.chunk_size = chunk_size.max(1);
+    }
 }
 
 #[derive(Clone, Debug)]
 struct RecordedRequest {
     method: Method,
     headers: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct TestUpstreamConfig {
+    chunked: bool,
+    chunk_size: usize,
+    etag: String,
+    last_modified: String,
+}
+
+impl Default for TestUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            chunked: false,
+            chunk_size: 4,
+            etag: "test-etag".to_string(),
+            last_modified: "Tue, 20 Feb 2024 10:00:00 GMT".to_string(),
+        }
+    }
 }
 
 async fn upstream_handler(
@@ -557,12 +750,25 @@ async fn upstream_handler(
 
     let full = state.body.clone();
     let total_len = full.len() as u64;
-    let range = headers
+    let requested_range = headers
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_range_header);
 
-    let (status, slice, length, range_metadata) = if let Some((start, end)) = range {
+    let if_range = headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok());
+
+    let config = { state.config.lock().await.clone() };
+
+    let allow_partial = match if_range {
+        Some(token) => token == config.etag || token == config.last_modified,
+        None => true,
+    };
+
+    let effective_range = if allow_partial { requested_range } else { None };
+
+    let (status, slice, length, range_metadata) = if let Some((start, end)) = effective_range {
         let end = end.min(full.len().saturating_sub(1));
         let start = start.min(end);
         let length = end - start + 1;
@@ -578,11 +784,14 @@ async fn upstream_handler(
 
     let mut builder = AxumResponse::builder().status(status);
     builder = builder.header(header::CONTENT_TYPE, "video/mp4");
-    builder = builder.header(
-        header::CONTENT_LENGTH,
-        HeaderValue::from_str(&length.to_string()).expect("valid content length"),
-    );
-    builder = builder.header(header::ETAG, "test-etag");
+    if !config.chunked || method == Method::HEAD {
+        builder = builder.header(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&length.to_string()).expect("valid content length"),
+        );
+    }
+    builder = builder.header(header::ETAG, config.etag.clone());
+    builder = builder.header(header::LAST_MODIFIED, config.last_modified.clone());
     builder = builder.header("x-unwanted", "true");
 
     if let Some((start, end, total)) = range_metadata {
@@ -597,9 +806,21 @@ async fn upstream_handler(
             .body(AxumBody::empty())
             .expect("head response should build")
     } else {
-        builder
-            .body(AxumBody::from(slice))
-            .expect("get response should build")
+        if config.chunked {
+            let chunk_size = config.chunk_size;
+            let chunks = slice
+                .chunks(chunk_size)
+                .map(|chunk| AxumBytes::copy_from_slice(chunk))
+                .collect::<Vec<_>>();
+            let stream = stream::iter(chunks.into_iter().map(|chunk| Ok::<_, Infallible>(chunk)));
+            builder
+                .body(AxumBody::from_stream(stream))
+                .expect("chunked response should build")
+        } else {
+            builder
+                .body(AxumBody::from(slice))
+                .expect("get response should build")
+        }
     }
 }
 
