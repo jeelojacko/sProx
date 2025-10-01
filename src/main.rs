@@ -100,6 +100,7 @@ fn build_app_state(config: &Config) -> Result<AppState> {
             tls_insecure_skip_verify: route.upstream.tls.insecure_skip_verify,
             socks5,
             hls,
+            retry: route.upstream.retry.clone().into(),
         };
 
         routing_table.insert(route.id.clone(), target);

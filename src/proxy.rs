@@ -22,6 +22,7 @@ use thiserror::Error;
 use tracing::{error, info};
 use url::Url;
 
+use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget};
 use crate::stream::hls;
@@ -63,6 +64,12 @@ pub enum ProxyError {
 
     #[error("error sending request upstream: {source}")]
     UpstreamRequest {
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("retry budget exhausted for upstream request: {source}")]
+    CircuitOpen {
         #[source]
         source: reqwest::Error,
     },
@@ -173,7 +180,7 @@ pub async fn forward(
         }
     })?;
 
-    let mut builder = client.request(method, upstream_url);
+    let mut builder = client.request(method, upstream_url.clone());
     builder = builder.headers(headers);
 
     let request_timeout = route
@@ -189,19 +196,34 @@ pub async fn forward(
         .into_stream();
     builder = builder.body(ReqwestBody::wrap_stream(body_stream));
 
+    let request = builder
+        .build()
+        .map_err(|source| ProxyError::UpstreamRequest { source })?;
+
     let request_start = Instant::now();
-    let upstream_response = match builder.send().await {
-        Ok(response) => response,
-        Err(source) => {
-            let latency_ms = request_start.elapsed().as_millis() as u64;
-            error!(
-                latency_ms,
-                error = %source,
-                "failed to forward request to upstream"
-            );
-            return Err(ProxyError::UpstreamRequest { source });
-        }
-    };
+    let retry_policy = route.retry.clone();
+    let upstream_response =
+        match retry::execute_with_retry(client.clone(), request, retry_policy).await {
+            Ok(response) => response,
+            Err(RetryError::BudgetExhausted { source }) => {
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                error!(
+                    latency_ms,
+                    error = %source,
+                    "retry budget exhausted while forwarding request"
+                );
+                return Err(ProxyError::CircuitOpen { source });
+            }
+            Err(RetryError::Request(source)) => {
+                let latency_ms = request_start.elapsed().as_millis() as u64;
+                error!(
+                    latency_ms,
+                    error = %source,
+                    "failed to forward request to upstream"
+                );
+                return Err(ProxyError::UpstreamRequest { source });
+            }
+        };
 
     let latency = request_start.elapsed();
     let latency_ms = latency.as_millis() as u64;
@@ -625,6 +647,7 @@ fn prepare_upstream_headers(
 mod tests {
     use super::*;
     use crate::routing::{PortRange, RouteDefinition, RouteProtocol, RouteRequest, RoutingEngine};
+    use crate::state::RetryPolicy;
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
@@ -755,6 +778,7 @@ mod tests {
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
+            retry: RetryPolicy::default(),
         };
         let uri: Uri = "/playlist.m3u8".parse().unwrap();
         let url = build_upstream_url(&target, &uri).unwrap();
@@ -875,6 +899,7 @@ mod tests {
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
+            retry: RetryPolicy::default(),
         };
 
         let builder = apply_client_timeouts(Client::builder(), &route);
@@ -999,6 +1024,7 @@ mod tests {
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
+            retry: RetryPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1042,6 +1068,7 @@ mod tests {
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
+            retry: RetryPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1084,6 +1111,7 @@ mod tests {
             tls_insecure_skip_verify: false,
             socks5: None,
             hls: None,
+            retry: RetryPolicy::default(),
         };
 
         let definition = RouteDefinition {

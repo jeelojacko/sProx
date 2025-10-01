@@ -79,10 +79,14 @@ Key configuration concepts:
 
 - **Listeners** – Control the transport protocol (HTTP/1.1, HTTP/2, QUIC), TLS settings
   for inbound traffic, and concurrency limits (to be implemented).
-- **Upstreams** – Describe where traffic is proxied, including TLS requirements,
-  optional SOCKS5 tunnelling, and retry budgets. Setting the `SPROX_PROXY_URL`
-  environment variable at runtime forces every route to tunnel through the
-  provided SOCKS5 endpoint regardless of the per-route configuration.
+- **Upstreams** – Describe where traffic is proxied, including per-hop timeout
+  knobs (connect/read/request), TLS requirements, optional SOCKS5 tunnelling,
+  and retry budgets. By default, retries allow three attempts with exponential
+  backoff starting at 100 ms (doubling up to 5 s) and 20 % jitter while the
+  budget replenishes over a 10 s window (20 % of requests may be retried with a
+  minimum reserve of 10 per second). Setting the `SPROX_PROXY_URL` environment
+  variable at runtime forces every route to tunnel through the provided SOCKS5
+  endpoint regardless of the per-route configuration.
 - **Streaming toggles** – Enable playlist rewriting, segment URL translation, DRM key
   acquisition, and future transcoding jobs.
 - **Environment overrides** – Sensitive values (API tokens, TLS private keys) are loaded

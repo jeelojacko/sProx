@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
 use globset::{Glob, GlobMatcher};
 use once_cell::sync::OnceCell;
-use reqwest::{redirect::Policy as RedirectPolicy, Client, Proxy};
+use reqwest::{redirect::Policy as RedirectPolicy, Client, Method, Proxy};
 use tokio::sync::RwLock;
+use tower::retry::budget::Budget;
 use url::Url;
 
 use crate::routing::RoutingEngine;
@@ -61,6 +63,147 @@ pub struct RouteTarget {
     pub socks5: Option<Socks5Proxy>,
     /// Optional HLS processing configuration applied to responses.
     pub hls: Option<HlsOptions>,
+    /// Retry policy used for outbound requests targeting this upstream.
+    pub retry: RetryPolicy,
+}
+
+/// Retry backoff configuration applied when scheduling retries.
+#[derive(Debug, Clone)]
+pub struct RetryBackoff {
+    pub initial_delay: Duration,
+    pub max_delay: Duration,
+    pub multiplier: f64,
+    pub jitter: f64,
+}
+
+impl RetryBackoff {
+    fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        let exponent = attempt.saturating_sub(1) as i32;
+        let mut delay = self.initial_delay.mul_f64(self.multiplier.powi(exponent));
+        if delay > self.max_delay {
+            delay = self.max_delay;
+        }
+        delay
+    }
+}
+
+impl Default for RetryBackoff {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(5),
+            multiplier: 2.0,
+            jitter: 0.2,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct RetryBudget {
+    ttl: Duration,
+    min_per_sec: u32,
+    retry_ratio: f32,
+    handle: Arc<Budget>,
+}
+
+impl RetryBudget {
+    pub fn new(ttl: Duration, min_per_sec: u32, retry_ratio: f32) -> Self {
+        let handle = Budget::new(ttl, min_per_sec, retry_ratio);
+        Self {
+            ttl,
+            min_per_sec,
+            retry_ratio,
+            handle: Arc::new(handle),
+        }
+    }
+
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    pub fn min_per_sec(&self) -> u32 {
+        self.min_per_sec
+    }
+
+    pub fn retry_ratio(&self) -> f32 {
+        self.retry_ratio
+    }
+
+    pub fn handle(&self) -> Arc<Budget> {
+        Arc::clone(&self.handle)
+    }
+}
+
+impl Clone for RetryBudget {
+    fn clone(&self) -> Self {
+        Self {
+            ttl: self.ttl,
+            min_per_sec: self.min_per_sec,
+            retry_ratio: self.retry_ratio,
+            handle: Arc::clone(&self.handle),
+        }
+    }
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(10), 10, 0.2)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    max_attempts: NonZeroU32,
+    backoff: RetryBackoff,
+    budget: RetryBudget,
+}
+
+impl RetryPolicy {
+    pub fn new(max_attempts: NonZeroU32, backoff: RetryBackoff, budget: RetryBudget) -> Self {
+        Self {
+            max_attempts,
+            backoff,
+            budget,
+        }
+    }
+
+    pub fn max_attempts(&self) -> NonZeroU32 {
+        self.max_attempts
+    }
+
+    pub fn backoff(&self) -> &RetryBackoff {
+        &self.backoff
+    }
+
+    pub fn budget(&self) -> &RetryBudget {
+        &self.budget
+    }
+
+    pub(crate) fn backoff_delay(&self, attempt: u32) -> Duration {
+        self.backoff.delay_for_attempt(attempt)
+    }
+
+    pub(crate) fn backoff_jitter(&self) -> f64 {
+        self.backoff.jitter
+    }
+
+    pub(crate) fn budget_handle(&self) -> Arc<Budget> {
+        self.budget.handle()
+    }
+
+    pub(crate) fn is_method_retryable(&self, method: &Method) -> bool {
+        matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: NonZeroU32::new(3).expect("static non-zero"),
+            backoff: RetryBackoff::default(),
+            budget: RetryBudget::default(),
+        }
+    }
 }
 
 /// Configuration for tunneling outbound requests through a SOCKS5 proxy.
@@ -154,9 +297,12 @@ impl Default for RateLimitConfig {
 pub struct DirectStreamSettings {
     proxy_url: Option<Url>,
     api_password: Option<String>,
+    connect_timeout: Option<Duration>,
+    read_timeout: Option<Duration>,
     request_timeout: Duration,
     response_buffer_bytes: usize,
     allowlist: DirectStreamAllowlist,
+    retry: RetryPolicy,
 }
 
 impl DirectStreamSettings {
@@ -174,6 +320,14 @@ impl DirectStreamSettings {
     /// Returns the configured API password when present.
     pub fn api_password(&self) -> Option<&str> {
         self.api_password.as_deref()
+    }
+
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.connect_timeout
+    }
+
+    pub fn read_timeout(&self) -> Option<Duration> {
+        self.read_timeout
     }
 
     /// Returns the request timeout applied to outbound direct stream requests.
@@ -195,6 +349,10 @@ impl DirectStreamSettings {
         self
     }
 
+    pub fn retry(&self) -> &RetryPolicy {
+        &self.retry
+    }
+
     pub fn is_request_header_allowed(&self, name: &str) -> bool {
         DIRECT_STREAM_REQUEST_HEADER_ALLOWLIST
             .iter()
@@ -207,9 +365,12 @@ impl Default for DirectStreamSettings {
         Self {
             proxy_url: None,
             api_password: None,
+            connect_timeout: Some(Duration::from_secs(10)),
+            read_timeout: Some(Duration::from_secs(30)),
             request_timeout: Self::default_request_timeout(),
             response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
             allowlist: DirectStreamAllowlist::default(),
+            retry: RetryPolicy::default(),
         }
     }
 }
@@ -220,10 +381,43 @@ impl From<crate::config::DirectStreamConfig> for DirectStreamSettings {
         Self {
             proxy_url: value.proxy_url,
             api_password: value.api_password,
+            connect_timeout: value.connect_timeout,
+            read_timeout: value.read_timeout,
             request_timeout: value.request_timeout,
             response_buffer_bytes: value.response_buffer_bytes,
             allowlist: value.allowlist.into(),
+            retry: value.retry.into(),
         }
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::RetryConfig> for RetryPolicy {
+    fn from(value: crate::config::RetryConfig) -> Self {
+        Self::new(
+            value.max_attempts,
+            value.backoff.into(),
+            value.budget.into(),
+        )
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::RetryBackoffConfig> for RetryBackoff {
+    fn from(value: crate::config::RetryBackoffConfig) -> Self {
+        Self {
+            initial_delay: value.initial_delay,
+            max_delay: value.max_delay,
+            multiplier: value.multiplier,
+            jitter: value.jitter,
+        }
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::RetryBudgetConfig> for RetryBudget {
+    fn from(value: crate::config::RetryBudgetConfig) -> Self {
+        RetryBudget::new(value.ttl, value.min_per_sec, value.retry_ratio)
     }
 }
 
@@ -379,13 +573,20 @@ impl DirectStreamState {
 }
 
 fn build_direct_stream_client(settings: &DirectStreamSettings) -> Result<Client, reqwest::Error> {
-    let mut builder = Client::builder()
-        .timeout(settings.request_timeout())
-        .redirect(RedirectPolicy::none());
+    let mut builder = Client::builder().redirect(RedirectPolicy::none());
 
     let resolver = Arc::new(crate::stream::direct::RestrictedDnsResolver::new());
 
     builder = builder.dns_resolver(resolver);
+
+    if let Some(connect) = settings.connect_timeout() {
+        builder = builder.connect_timeout(connect);
+    }
+
+    let read_timeout = settings
+        .read_timeout()
+        .unwrap_or(settings.request_timeout());
+    builder = builder.timeout(read_timeout);
 
     if let Some(proxy_url) = settings.proxy_url() {
         builder = builder.proxy(Proxy::all(proxy_url.as_str())?);
@@ -577,6 +778,7 @@ mod tests {
                 tls_insecure_skip_verify: false,
                 socks5: None,
                 hls: None,
+                retry: RetryPolicy::default(),
             },
         );
 
@@ -609,9 +811,12 @@ mod tests {
         let settings = DirectStreamSettings {
             proxy_url: Some(Url::parse("http://proxy.example:3128").unwrap()),
             api_password: Some("super-secret".into()),
+            connect_timeout: Some(Duration::from_secs(5)),
+            read_timeout: Some(Duration::from_secs(20)),
             request_timeout: Duration::from_secs(10),
             response_buffer_bytes: 131_072,
             allowlist: DirectStreamAllowlist::default(),
+            retry: RetryPolicy::default(),
         };
 
         let state = AppState::new().with_direct_stream_settings(settings.clone());
