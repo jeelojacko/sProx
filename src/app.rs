@@ -51,6 +51,9 @@ use tracing::error;
 pub fn build_router(state: AppState) -> Router {
     let rate_limit_layer = RateLimitLayer::new(state.rate_limit_config());
 
+    #[cfg(feature = "telemetry")]
+    let sensitive_logging = state.sensitive_logging().clone();
+
     let router = Router::new()
         .route("/health", get(health_check))
         .route("/ip", get(report_client_ip))
@@ -70,12 +73,12 @@ pub fn build_router(state: AppState) -> Router {
     let router = router.route("/metrics", get(prometheus_metrics));
 
     #[cfg(feature = "telemetry")]
-    let router = router.layer(
+    let router = router.layer({
+        let logging = sensitive_logging.clone();
+
         TraceLayer::new_for_http()
-            .make_span_with(|request: &Request<Body>| {
-                let state = request.extensions().get::<AppState>();
-                let (user_agent, uri) =
-                    span_fields(request, state.map(AppState::sensitive_logging));
+            .make_span_with(move |request: &Request<Body>| {
+                let (user_agent, uri) = span_fields(request, Some(&logging));
 
                 tracing::info_span!(
                     "http.request",
@@ -89,8 +92,8 @@ pub fn build_router(state: AppState) -> Router {
                 DefaultOnResponse::new()
                     .level(Level::INFO)
                     .latency_unit(LatencyUnit::Millis),
-            ),
-    );
+            )
+    });
 
     router
 }
