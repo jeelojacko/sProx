@@ -39,7 +39,7 @@ use thiserror::Error;
 use url::form_urlencoded;
 
 use crate::retry;
-use crate::state::{AppState, DirectStreamSettings};
+use crate::state::{DirectStreamSettings, SharedAppState};
 use crate::util;
 use tracing::{error, info};
 
@@ -336,7 +336,7 @@ impl DirectStreamError {
     )
 )]
 pub async fn handle_proxy_stream(
-    State(state): State<AppState>,
+    State(state): State<SharedAppState>,
     downstream_headers: HeaderMap,
     uri: Uri,
     Query(query): Query<DirectStreamQuery>,
@@ -349,7 +349,11 @@ pub async fn handle_proxy_stream(
         return Err(DirectStreamError::MissingDestination.into_response());
     }
 
-    if let Some(expected_password) = state.direct_stream_api_password() {
+    if let Some(expected_password) = state.with_current(|state| {
+        state
+            .direct_stream_api_password()
+            .map(|value| value.to_owned())
+    }) {
         let provided_password = extract_api_password(&downstream_headers, &query);
         match provided_password {
             Some(value) if value == expected_password => {}
@@ -366,14 +370,16 @@ pub async fn handle_proxy_stream(
         .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
     span.record("upstream.url", &tracing::field::display(&upstream_url));
 
-    let settings = state.direct_stream_settings().cloned().unwrap_or_default();
+    let settings = state
+        .with_current(|state| state.direct_stream_settings().cloned())
+        .unwrap_or_default();
 
     let overrides = extract_header_overrides(&uri);
     let upstream_headers = prepare_upstream_headers(&downstream_headers, &overrides, &settings)
         .map_err(|error| error.into_response())?;
 
     let client = state
-        .direct_stream_client()
+        .with_current(|state| state.direct_stream_client())
         .map_err(|source| DirectStreamError::ClientBuild { source }.into_response())?;
     let service = DirectStreamService::new(client, settings);
 

@@ -24,7 +24,7 @@ use url::Url;
 
 use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
-use crate::state::{AppState, RouteTarget};
+use crate::state::{AppState, RouteTarget, SharedAppState};
 use crate::stream::hls;
 use crate::util;
 
@@ -145,9 +145,11 @@ pub enum ProxyError {
     )
 )]
 pub async fn forward(
-    state: AppState,
+    state: SharedAppState,
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
+    let snapshot = state.snapshot();
+    let state = snapshot.as_ref();
     let request_id = util::extract_request_id(request.headers());
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
     let span = tracing::Span::current();
@@ -162,7 +164,7 @@ pub async fn forward(
         port,
     };
 
-    let (route_id, route) = lookup_route(&state, &host, &route_request).await?;
+    let (route_id, route) = lookup_route(state, &host, &route_request).await?;
     span.record("route.id", &tracing::field::display(&route_id));
     let upstream_url = build_upstream_url(&route, request.uri())?;
     span.record("upstream.url", &tracing::field::display(&upstream_url));
@@ -1289,7 +1291,7 @@ mod tests {
             protocols: vec![RouteProtocol::Http],
             ports: vec![PortRange::new(80, 80).unwrap()],
         };
-        let state = state_with_single_route(definition, route);
+        let state = SharedAppState::new(state_with_single_route(definition, route));
 
         let request = Request::builder()
             .uri("http://timeout.test/playlist.m3u8")
@@ -1334,7 +1336,7 @@ mod tests {
             protocols: vec![RouteProtocol::Http],
             ports: vec![PortRange::new(80, 80).unwrap()],
         };
-        let state = state_with_single_route(definition, route);
+        let state = SharedAppState::new(state_with_single_route(definition, route));
 
         let request = Request::builder()
             .uri("http://timeout.test/index.m3u8")
@@ -1378,7 +1380,7 @@ mod tests {
             protocols: vec![RouteProtocol::Http],
             ports: vec![PortRange::new(80, 80).unwrap()],
         };
-        let state = state_with_single_route(definition, route);
+        let state = SharedAppState::new(state_with_single_route(definition, route));
 
         let request = Request::builder()
             .uri("http://trace.test/")
@@ -1593,7 +1595,7 @@ mod tests {
                 protocols: vec![RouteProtocol::Http],
                 ports: vec![PortRange::new(80, 80).unwrap()],
             };
-            let state = state_with_single_route(definition, route);
+            let state = SharedAppState::new(state_with_single_route(definition, route));
 
             let request = Request::builder()
                 .uri("http://cdn.test/master.m3u8")

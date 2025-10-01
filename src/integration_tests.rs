@@ -26,7 +26,7 @@ use sProx::config::{
     HeaderPolicyConfig, ListenerConfig, RetryConfig, RouteConfig, SecretsConfig,
     SensitiveLoggingConfig, Socks5Config, TlsConfig, UpstreamConfig, XForwardedForConfig,
 };
-use sProx::state::{AppState, DirectStreamSettings};
+use sProx::state::{AppState, DirectStreamSettings, SharedAppState};
 
 #[cfg(feature = "telemetry")]
 fn ensure_telemetry_initialized() {
@@ -169,8 +169,8 @@ async fn spawn_route_proxy_context(
         sensitive_logging: SensitiveLoggingConfig::default(),
     };
 
-    let state = build_app_state(&config).expect("app state should build");
-    let router = app::build_router(state);
+    let state = AppState::from_config(&config).expect("app state should build");
+    let router = app::build_router(SharedAppState::new(state));
     let (proxy_shutdown, proxy_rx) = oneshot::channel();
     let proxy_handle = tokio::spawn(async move {
         let _ = axum::serve(proxy_listener, router)
@@ -253,8 +253,8 @@ async fn health_endpoint_returns_success() {
         sensitive_logging: SensitiveLoggingConfig::default(),
     };
 
-    let state = build_app_state(&config).expect("app state should build");
-    let router = app::build_router(state);
+    let state = AppState::from_config(&config).expect("app state should build");
+    let router = app::build_router(SharedAppState::new(state));
 
     let listener_cfg = primary_listener(&config).expect("listener should be available");
     let addr = resolve_listener_addr(listener_cfg).expect("listener address should resolve");
@@ -392,7 +392,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
         sensitive_logging: SensitiveLoggingConfig::default(),
     };
 
-    let state = build_app_state(&config).expect("app state should build");
+    let state = AppState::from_config(&config).expect("app state should build");
     let routing_table = state.routing_table();
     let table = routing_table.read().await;
 
@@ -1187,7 +1187,7 @@ where
     let settings: DirectStreamSettings = direct_stream.into();
 
     let app_state = AppState::new().with_direct_stream_settings(settings);
-    let router = app::build_router(app_state);
+    let router = app::build_router(SharedAppState::new(app_state));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("proxy should bind");

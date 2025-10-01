@@ -22,7 +22,7 @@ use crate::security::SecurityError;
 #[cfg(feature = "drm")]
 use crate::{
     security,
-    state::{AppState, SecretsStore},
+    state::{SecretsStore, SharedAppState},
 };
 #[cfg(feature = "drm")]
 use serde::{Deserialize, Serialize};
@@ -158,7 +158,7 @@ pub fn extract_default_kids(mpd: &str) -> Result<Vec<Uuid>, DashError> {
 /// signing secret. Only requests with valid signatures return key material.
 #[cfg(feature = "drm")]
 pub async fn clearkey_jwks(
-    State(state): State<AppState>,
+    State(state): State<SharedAppState>,
     Host(host): Host,
     OriginalUri(original_uri): OriginalUri,
     Query(query): Query<ClearKeyQuery>,
@@ -170,7 +170,7 @@ pub async fn clearkey_jwks(
     let kid_bytes = decode_kid(&query.kid)?;
 
     let signing_secret = {
-        let secrets = state.secrets();
+        let secrets = state.with_current(|app| app.secrets());
         let mut secrets_guard = secrets.write().await;
         secrets_guard.purge_expired();
         let Some(secret) = secrets_guard.get(CLEARKEY_SIGNING_SECRET) else {
@@ -186,7 +186,7 @@ pub async fn clearkey_jwks(
     }
 
     let (key_name, key_value) = {
-        let secrets = state.secrets();
+        let secrets = state.with_current(|app| app.secrets());
         let mut secrets_guard = secrets.write().await;
         secrets_guard.purge_expired();
         find_key_entry(&mut secrets_guard, &query.kid, &kid_bytes)?
@@ -432,9 +432,9 @@ mod drm_tests {
         let key_b64 = URL_SAFE_NO_PAD.encode(key_material);
         let signing_secret = "super-secret".to_string();
 
-        let state = AppState::new();
+        let state = SharedAppState::new(AppState::new());
         {
-            let secrets_handle = state.secrets();
+            let secrets_handle = state.with_current(|app| app.secrets());
             let mut secrets = secrets_handle.write().await;
             secrets.insert(
                 CLEARKEY_SIGNING_SECRET.to_string(),
@@ -494,9 +494,9 @@ mod drm_tests {
         let signing_secret = "super-secret".to_string();
         let key_b64 = URL_SAFE_NO_PAD.encode([0u8; 16]);
 
-        let state = AppState::new();
+        let state = SharedAppState::new(AppState::new());
         {
-            let secrets_handle = state.secrets();
+            let secrets_handle = state.with_current(|app| app.secrets());
             let mut secrets = secrets_handle.write().await;
             secrets.insert(
                 CLEARKEY_SIGNING_SECRET.to_string(),
@@ -544,7 +544,7 @@ mod drm_tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let secrets_handle = state.secrets();
+        let secrets_handle = state.with_current(|app| app.secrets());
         let mut secrets = secrets_handle.write().await;
         assert!(secrets
             .get(&format!(
