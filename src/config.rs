@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use config as config_rs;
 use globset::Glob;
+use http::header::HeaderName;
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -141,6 +142,36 @@ pub struct UpstreamConfig {
     pub tls: TlsConfig,
     pub socks5: Socks5Config,
     pub retry: RetryConfig,
+    pub header_policy: HeaderPolicyConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeaderPolicyConfig {
+    pub allow: Vec<HeaderName>,
+    pub deny: Vec<HeaderName>,
+    pub x_forwarded_for: XForwardedForConfig,
+}
+
+impl Default for HeaderPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            x_forwarded_for: XForwardedForConfig::Append,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XForwardedForConfig {
+    Append,
+    Replace,
+}
+
+impl Default for XForwardedForConfig {
+    fn default() -> Self {
+        Self::Append
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -351,6 +382,8 @@ struct RawUpstream {
     socks5: RawSocks5,
     #[serde(default)]
     retry: Option<RawRetry>,
+    #[serde(default)]
+    headers: RawHeaderPolicy,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -387,6 +420,16 @@ struct RawHls {
     base_url: Option<String>,
     #[serde(default)]
     allow_insecure_segments: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawHeaderPolicy {
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    x_forwarded_for: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -861,6 +904,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
     let tls = parse_tls(raw.tls, &tls_context);
     let socks5 = parse_socks5(raw.socks5, context)?;
     let retry = parse_retry(raw.retry, format!("{context}.upstream.retry"))?;
+    let header_policy = parse_header_policy(raw.headers, format!("{context}.upstream.headers"))?;
 
     Ok(UpstreamConfig {
         origin,
@@ -870,6 +914,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         tls,
         socks5,
         retry,
+        header_policy,
     })
 }
 
@@ -1014,6 +1059,64 @@ fn parse_hls(raw: RawHls, context: &str) -> Result<HlsConfig, ConfigError> {
     })
 }
 
+fn parse_header_policy(
+    raw: RawHeaderPolicy,
+    context: String,
+) -> Result<HeaderPolicyConfig, ConfigError> {
+    let allow = parse_header_names(raw.allow, format!("{context}.allow"))?;
+    let deny = parse_header_names(raw.deny, format!("{context}.deny"))?;
+
+    let x_forwarded_for_raw = raw
+        .x_forwarded_for
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase());
+    let x_forwarded_for = match x_forwarded_for_raw.as_deref() {
+        None | Some("") => XForwardedForConfig::Append,
+        Some("append") => XForwardedForConfig::Append,
+        Some("replace") => XForwardedForConfig::Replace,
+        Some(value) => {
+            return Err(validation_error(
+                format!("{context}.x_forwarded_for"),
+                format!("unsupported value `{value}`; expected `append` or `replace`"),
+            ));
+        }
+    };
+
+    Ok(HeaderPolicyConfig {
+        allow,
+        deny,
+        x_forwarded_for,
+    })
+}
+
+fn parse_header_names(
+    values: Vec<String>,
+    context: String,
+) -> Result<Vec<HeaderName>, ConfigError> {
+    let mut parsed = Vec::with_capacity(values.len());
+
+    for (idx, value) in values.into_iter().enumerate() {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}[{idx}]"),
+                "header name must not be empty",
+            ));
+        }
+
+        let header = HeaderName::try_from(trimmed).map_err(|err| {
+            validation_error(
+                format!("{context}[{idx}]"),
+                format!("invalid header name `{trimmed}`: {err}"),
+            )
+        })?;
+
+        parsed.push(header);
+    }
+
+    Ok(parsed)
+}
+
 fn optional_duration_from_millis(
     value: Option<u64>,
     context: String,
@@ -1099,6 +1202,7 @@ mod tests {
                 tls: RawTls::default(),
                 socks5: RawSocks5::default(),
                 retry: None,
+                headers: RawHeaderPolicy::default(),
             },
             hls: None,
         }
@@ -1176,6 +1280,7 @@ mod tests {
                     tls: RawTls::default(),
                     socks5: RawSocks5::default(),
                     retry: None,
+                    headers: RawHeaderPolicy::default(),
                 },
                 hls: None,
             }],
