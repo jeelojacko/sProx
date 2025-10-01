@@ -101,6 +101,7 @@ fn build_app_state(config: &Config) -> Result<AppState> {
             socks5,
             hls,
             retry: route.upstream.retry.clone().into(),
+            header_policy: route.upstream.header_policy.clone().into(),
         };
 
         routing_table.insert(route.id.clone(), target);

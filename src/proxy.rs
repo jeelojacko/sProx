@@ -30,6 +30,7 @@ use crate::stream::hls;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const VIA_HEADER_VALUE: &str = "1.1 sProx";
 
 /// Errors that can occur while proxying a request.
 #[derive(Debug, Error)]
@@ -172,7 +173,13 @@ pub async fn forward(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr);
-    let headers = prepare_upstream_headers(request.headers(), remote_addr, &host, &client_scheme)?;
+    let headers = prepare_upstream_headers(
+        request.headers(),
+        remote_addr,
+        &host,
+        &client_scheme,
+        &route,
+    )?;
 
     let method = ReqwestMethod::from_bytes(request.method().as_str().as_bytes()).map_err(|_| {
         ProxyError::UnsupportedMethod {
@@ -248,12 +255,37 @@ pub async fn forward(
 
     let upstream_headers = upstream_response.headers().clone();
     let mut header_entries = Vec::with_capacity(upstream_headers.len());
+    let mut response_via_values = Vec::new();
     for (name, value) in upstream_headers.iter() {
+        if name.as_str() == "via" {
+            if let Ok(via) = value.to_str() {
+                let via = via.trim();
+                if !via.is_empty() {
+                    response_via_values.push(via.to_string());
+                }
+            }
+            continue;
+        }
+
         let header_name = HeaderName::from_bytes(name.as_str().as_bytes())
             .map_err(|source| ProxyError::InvalidInboundHeaderName { source })?;
+
+        if should_strip_response_header(&header_name, &route.header_policy) {
+            continue;
+        }
+
         let header_value = HeaderValue::from_bytes(value.as_bytes())
             .map_err(|source| ProxyError::InvalidInboundHeaderValue { source })?;
         header_entries.push((header_name, header_value));
+    }
+
+    response_via_values.push(VIA_HEADER_VALUE.to_string());
+    if let Some(via_value) = join_values(&response_via_values) {
+        header_entries.push((
+            HeaderName::from_static("via"),
+            HeaderValue::from_str(&via_value)
+                .map_err(|source| ProxyError::InvalidInboundHeaderValue { source })?,
+        ));
     }
 
     let should_process_hls = route
@@ -594,15 +626,22 @@ fn prepare_upstream_headers(
     remote_addr: Option<SocketAddr>,
     host: &str,
     scheme: &str,
+    route: &RouteTarget,
 ) -> Result<ReqwestHeaderMap, ProxyError> {
     let mut headers = ReqwestHeaderMap::new();
     let forwarded_host_req = ReqwestHeaderName::from_static("x-forwarded-host");
     let forwarded_proto_req = ReqwestHeaderName::from_static("x-forwarded-proto");
     let forwarded_for_req = ReqwestHeaderName::from_static("x-forwarded-for");
     let forwarded_for_lookup = HeaderName::from_static("x-forwarded-for");
+    let via_lookup = HeaderName::from_static("via");
+    let policy = &route.header_policy;
 
     for (name, value) in downstream.iter() {
-        if name == HOST {
+        if name == HOST || is_reserved_request_header(name) {
+            continue;
+        }
+
+        if should_strip_request_header(name, policy) {
             continue;
         }
 
@@ -621,26 +660,136 @@ fn prepare_upstream_headers(
         .map_err(|source| ProxyError::InvalidOutboundHeaderValue { source })?;
     headers.insert(forwarded_proto_req, proto_value);
 
-    if let Some(addr) = remote_addr {
-        let mut value = String::new();
-        if let Some(existing) = downstream.get(&forwarded_for_lookup) {
-            let existing = existing.to_str()?;
-            if !existing.is_empty() {
-                value.push_str(existing);
-                value.push_str(", ");
-            }
-        }
-        value.push_str(&addr.ip().to_string());
+    let existing_forwarded_for =
+        collect_header_values(downstream.get_all(&forwarded_for_lookup).iter())?;
+    let forwarded_for_value =
+        build_forwarded_for(join_values(&existing_forwarded_for), remote_addr, policy);
+    if let Some(value) = forwarded_for_value {
         let forwarded_value = ReqwestHeaderValue::from_str(&value)
-            .map_err(|source| ProxyError::InvalidOutboundHeaderValue { source })?;
-        headers.insert(forwarded_for_req, forwarded_value);
-    } else if let Some(existing) = downstream.get(&forwarded_for_lookup) {
-        let forwarded_value = ReqwestHeaderValue::from_bytes(existing.as_bytes())
             .map_err(|source| ProxyError::InvalidOutboundHeaderValue { source })?;
         headers.insert(forwarded_for_req, forwarded_value);
     }
 
+    let mut via_values = collect_header_values(downstream.get_all(&via_lookup).iter())?;
+    via_values.push(VIA_HEADER_VALUE.to_string());
+    if let Some(via_value) = join_values(&via_values) {
+        let via_header = ReqwestHeaderName::from_static("via");
+        let via_value = ReqwestHeaderValue::from_str(&via_value)
+            .map_err(|source| ProxyError::InvalidOutboundHeaderValue { source })?;
+        headers.insert(via_header, via_value);
+    }
+
     Ok(headers)
+}
+
+fn collect_header_values<'a, I>(values: I) -> Result<Vec<String>, ProxyError>
+where
+    I: IntoIterator<Item = &'a HeaderValue>,
+{
+    let mut parts = Vec::new();
+    for value in values {
+        let value = value.to_str()?.trim();
+        if !value.is_empty() {
+            parts.push(value.to_string());
+        }
+    }
+
+    Ok(parts)
+}
+
+fn join_values(values: &[String]) -> Option<String> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", "))
+    }
+}
+
+fn build_forwarded_for(
+    existing: Option<String>,
+    remote_addr: Option<SocketAddr>,
+    policy: &crate::state::HeaderPolicy,
+) -> Option<String> {
+    let client_ip = remote_addr.map(|addr| addr.ip().to_string());
+    match policy.x_forwarded_for() {
+        crate::state::XForwardedFor::Replace => client_ip,
+        crate::state::XForwardedFor::Append => match (existing, client_ip) {
+            (Some(existing), Some(ip)) => Some(format!("{existing}, {ip}")),
+            (None, Some(ip)) => Some(ip),
+            (existing, None) => existing,
+        },
+    }
+}
+
+fn should_strip_request_header(name: &HeaderName, policy: &crate::state::HeaderPolicy) -> bool {
+    if is_sensitive_request_header(name) && policy.is_explicitly_allowed(name) {
+        return false;
+    }
+
+    if policy.is_explicitly_allowed(name) {
+        return false;
+    }
+
+    if policy.is_explicitly_denied(name) {
+        return true;
+    }
+
+    if is_sensitive_request_header(name) {
+        return true;
+    }
+
+    is_hop_by_hop_request_header(name.as_str())
+}
+
+fn should_strip_response_header(name: &HeaderName, policy: &crate::state::HeaderPolicy) -> bool {
+    if policy.is_explicitly_allowed(name) {
+        return false;
+    }
+
+    if policy.is_explicitly_denied(name) {
+        return true;
+    }
+
+    is_hop_by_hop_response_header(name.as_str())
+}
+
+fn is_reserved_request_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "forwarded" | "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host" | "via"
+    )
+}
+
+fn is_sensitive_request_header(name: &HeaderName) -> bool {
+    matches!(name.as_str(), "authorization" | "proxy-authorization")
+}
+
+fn is_hop_by_hop_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+    )
+}
+
+fn is_hop_by_hop_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "proxy-connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+    )
 }
 
 #[cfg(test)]
@@ -837,6 +986,7 @@ mod tests {
             socks5: None,
             hls: None,
             retry: RetryPolicy::default(),
+            header_policy: crate::state::HeaderPolicy::default(),
         };
         let uri: Uri = "/playlist.m3u8".parse().unwrap();
         let url = build_upstream_url(&target, &uri).unwrap();
@@ -851,11 +1001,16 @@ mod tests {
             HeaderName::from_static("x-forwarded-for"),
             HeaderValue::from_static("203.0.113.1"),
         );
+        let route = RouteTarget {
+            header_policy: crate::state::HeaderPolicy::default(),
+            ..RouteTarget::default()
+        };
         let headers = prepare_upstream_headers(
             &downstream,
             Some("198.51.100.10:1234".parse().unwrap()),
             "cdn.example.com",
             "https",
+            &route,
         )
         .unwrap();
 
@@ -958,6 +1113,7 @@ mod tests {
             socks5: None,
             hls: None,
             retry: RetryPolicy::default(),
+            header_policy: crate::state::HeaderPolicy::default(),
         };
 
         let builder = apply_client_timeouts(Client::builder(), &route);
@@ -1083,6 +1239,7 @@ mod tests {
             socks5: None,
             hls: None,
             retry: RetryPolicy::default(),
+            header_policy: crate::state::HeaderPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1127,6 +1284,7 @@ mod tests {
             socks5: None,
             hls: None,
             retry: RetryPolicy::default(),
+            header_policy: crate::state::HeaderPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1170,6 +1328,7 @@ mod tests {
             socks5: None,
             hls: None,
             retry: RetryPolicy::default(),
+            header_policy: crate::state::HeaderPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1384,6 +1543,7 @@ mod tests {
                 socks5: None,
                 hls: Some(hls_options),
                 retry: RetryPolicy::default(),
+                header_policy: crate::state::HeaderPolicy::default(),
             };
 
             let definition = RouteDefinition {

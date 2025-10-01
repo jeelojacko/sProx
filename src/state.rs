@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobMatcher};
+use http::header::HeaderName;
 use once_cell::sync::OnceCell;
 use reqwest::{redirect::Policy as RedirectPolicy, Client, Method, Proxy};
 use tokio::sync::RwLock;
@@ -65,6 +66,56 @@ pub struct RouteTarget {
     pub hls: Option<HlsOptions>,
     /// Retry policy used for outbound requests targeting this upstream.
     pub retry: RetryPolicy,
+    /// Header forwarding policy applied when proxying requests and responses.
+    pub header_policy: HeaderPolicy,
+}
+
+/// Strategy applied when constructing the `X-Forwarded-For` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XForwardedFor {
+    /// Append the client IP to any existing header chain.
+    #[default]
+    Append,
+    /// Replace the existing header with only the client IP.
+    Replace,
+}
+
+/// Header forwarding policy for a given route.
+#[derive(Debug, Clone, Default)]
+pub struct HeaderPolicy {
+    allow: HashSet<String>,
+    deny: HashSet<String>,
+    x_forwarded_for: XForwardedFor,
+}
+
+impl HeaderPolicy {
+    /// Creates a new header policy with the provided configuration.
+    pub fn new(
+        allow: HashSet<String>,
+        deny: HashSet<String>,
+        x_forwarded_for: XForwardedFor,
+    ) -> Self {
+        Self {
+            allow,
+            deny,
+            x_forwarded_for,
+        }
+    }
+
+    /// Returns true if the header should be forwarded regardless of other rules.
+    pub fn is_explicitly_allowed(&self, header: &HeaderName) -> bool {
+        self.allow.contains(header.as_str())
+    }
+
+    /// Returns true if the header is explicitly denied by configuration.
+    pub fn is_explicitly_denied(&self, header: &HeaderName) -> bool {
+        self.deny.contains(header.as_str())
+    }
+
+    /// Returns the configured X-Forwarded-For strategy.
+    pub fn x_forwarded_for(&self) -> XForwardedFor {
+        self.x_forwarded_for
+    }
 }
 
 /// Retry backoff configuration applied when scheduling retries.
@@ -537,6 +588,35 @@ impl From<crate::config::RetryConfig> for RetryPolicy {
 }
 
 #[cfg(feature = "config-loader")]
+impl From<crate::config::HeaderPolicyConfig> for HeaderPolicy {
+    fn from(value: crate::config::HeaderPolicyConfig) -> Self {
+        Self::new(
+            value
+                .allow
+                .into_iter()
+                .map(|name| name.as_str().to_string())
+                .collect(),
+            value
+                .deny
+                .into_iter()
+                .map(|name| name.as_str().to_string())
+                .collect(),
+            value.x_forwarded_for.into(),
+        )
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::XForwardedForConfig> for XForwardedFor {
+    fn from(value: crate::config::XForwardedForConfig) -> Self {
+        match value {
+            crate::config::XForwardedForConfig::Append => XForwardedFor::Append,
+            crate::config::XForwardedForConfig::Replace => XForwardedFor::Replace,
+        }
+    }
+}
+
+#[cfg(feature = "config-loader")]
 impl From<crate::config::RetryBackoffConfig> for RetryBackoff {
     fn from(value: crate::config::RetryBackoffConfig) -> Self {
         Self {
@@ -937,6 +1017,7 @@ mod tests {
                 socks5: None,
                 hls: None,
                 retry: RetryPolicy::default(),
+                header_policy: HeaderPolicy::default(),
             },
         );
 

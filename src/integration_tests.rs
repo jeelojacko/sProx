@@ -23,10 +23,179 @@ use url::Url;
 
 use sProx::config::{
     Config, DirectStreamAllowRule, DirectStreamAllowlist, DirectStreamConfig, DirectStreamScheme,
-    ListenerConfig, RetryConfig, RouteConfig, SecretsConfig, SensitiveLoggingConfig, Socks5Config,
-    TlsConfig, UpstreamConfig,
+    HeaderPolicyConfig, ListenerConfig, RetryConfig, RouteConfig, SecretsConfig,
+    SensitiveLoggingConfig, Socks5Config, TlsConfig, UpstreamConfig, XForwardedForConfig,
 };
 use sProx::state::{AppState, DirectStreamSettings};
+
+#[derive(Clone)]
+struct RouteProxyUpstreamState {
+    log: Arc<Mutex<Vec<RecordedRequest>>>,
+    response_headers: Arc<Vec<(String, String)>>,
+}
+
+impl RouteProxyUpstreamState {
+    fn new(response_headers: Vec<(String, String)>) -> Self {
+        Self {
+            log: Arc::new(Mutex::new(Vec::new())),
+            response_headers: Arc::new(response_headers),
+        }
+    }
+
+    fn log(&self) -> Arc<Mutex<Vec<RecordedRequest>>> {
+        Arc::clone(&self.log)
+    }
+
+    fn response_headers(&self) -> Arc<Vec<(String, String)>> {
+        Arc::clone(&self.response_headers)
+    }
+}
+
+struct RouteProxyContext {
+    proxy_addr: SocketAddr,
+    upstream_log: Arc<Mutex<Vec<RecordedRequest>>>,
+    proxy_shutdown: Option<oneshot::Sender<()>>,
+    upstream_shutdown: Option<oneshot::Sender<()>>,
+    proxy_handle: JoinHandle<()>,
+    upstream_handle: JoinHandle<()>,
+}
+
+impl RouteProxyContext {
+    fn proxy_addr(&self) -> SocketAddr {
+        self.proxy_addr
+    }
+
+    fn upstream_log(&self) -> Arc<Mutex<Vec<RecordedRequest>>> {
+        Arc::clone(&self.upstream_log)
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.proxy_shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.upstream_shutdown.take() {
+            let _ = tx.send(());
+        }
+
+        let _ = self.proxy_handle.await;
+        let _ = self.upstream_handle.await;
+    }
+}
+
+async fn spawn_route_proxy_context(
+    header_policy: HeaderPolicyConfig,
+    response_headers: Vec<(String, String)>,
+) -> RouteProxyContext {
+    let upstream_state = RouteProxyUpstreamState::new(response_headers);
+    let upstream_log = upstream_state.log();
+    let upstream_router = Router::new()
+        .route("/asset", get(route_upstream_handler))
+        .with_state(upstream_state.clone());
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream should bind");
+    let upstream_addr = upstream_listener
+        .local_addr()
+        .expect("upstream should expose local address");
+    let (upstream_shutdown, upstream_rx) = oneshot::channel();
+    let upstream_handle = tokio::spawn(async move {
+        let _ = axum::serve(upstream_listener, upstream_router)
+            .with_graceful_shutdown(async {
+                let _ = upstream_rx.await;
+            })
+            .await;
+    });
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("proxy should bind");
+    let proxy_addr = proxy_listener
+        .local_addr()
+        .expect("proxy should expose local address");
+
+    let config = Config {
+        direct_stream: None,
+        routes: vec![RouteConfig {
+            id: "proxy-route".into(),
+            listen: ListenerConfig {
+                host: "127.0.0.1".into(),
+                port: proxy_addr.port(),
+            },
+            host_patterns: vec!["127.0.0.1".into()],
+            protocols: Vec::new(),
+            upstream: UpstreamConfig {
+                origin: Url::parse(&format!("http://{upstream_addr}"))
+                    .expect("origin should parse"),
+                connect_timeout: Some(Duration::from_secs(1)),
+                read_timeout: Some(Duration::from_secs(1)),
+                request_timeout: Some(Duration::from_secs(1)),
+                tls: TlsConfig {
+                    enabled: false,
+                    sni_hostname: None,
+                    insecure_skip_verify: false,
+                },
+                socks5: Socks5Config {
+                    enabled: false,
+                    address: None,
+                    username: None,
+                    password: None,
+                },
+                retry: RetryConfig::default(),
+                header_policy,
+            },
+            hls: None,
+        }],
+        secrets: SecretsConfig::default(),
+        sensitive_logging: SensitiveLoggingConfig::default(),
+    };
+
+    let state = build_app_state(&config).expect("app state should build");
+    let router = app::build_router(state);
+    let (proxy_shutdown, proxy_rx) = oneshot::channel();
+    let proxy_handle = tokio::spawn(async move {
+        let _ = axum::serve(proxy_listener, router)
+            .with_graceful_shutdown(async {
+                let _ = proxy_rx.await;
+            })
+            .await;
+    });
+
+    RouteProxyContext {
+        proxy_addr,
+        upstream_log,
+        proxy_shutdown: Some(proxy_shutdown),
+        upstream_shutdown: Some(upstream_shutdown),
+        proxy_handle,
+        upstream_handle,
+    }
+}
+
+async fn route_upstream_handler(
+    AxumState(state): AxumState<RouteProxyUpstreamState>,
+    method: Method,
+    headers: HeaderMap,
+) -> AxumResponse {
+    let mut recorded_headers = Vec::new();
+    for (name, value) in headers.iter() {
+        if let Ok(value) = value.to_str() {
+            recorded_headers.push((name.as_str().to_string(), value.to_string()));
+        }
+    }
+    state.log.lock().await.push(RecordedRequest {
+        method,
+        headers: recorded_headers,
+    });
+
+    let mut builder = AxumResponse::builder().status(AxumStatusCode::OK);
+    for (name, value) in state.response_headers().iter() {
+        builder = builder.header(name, value);
+    }
+
+    builder
+        .body(AxumBody::empty())
+        .expect("response should build")
+}
 
 #[tokio::test]
 async fn health_endpoint_returns_success() {
@@ -57,6 +226,7 @@ async fn health_endpoint_returns_success() {
                     password: None,
                 },
                 retry: RetryConfig::default(),
+                header_policy: HeaderPolicyConfig::default(),
             },
             hls: None,
         }],
@@ -132,6 +302,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
                     password: Some("secret".into()),
                 },
                 retry: RetryConfig::default(),
+                header_policy: HeaderPolicyConfig::default(),
             },
             hls: None,
         };
@@ -161,6 +332,162 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
     }
 
     env::remove_var("SPROX_PROXY_URL");
+}
+
+#[tokio::test]
+async fn proxy_strips_hop_by_hop_headers_and_normalizes_forwarders() {
+    let response_headers = vec![
+        ("Connection".to_string(), "keep-alive".to_string()),
+        (
+            "Proxy-Authenticate".to_string(),
+            "Basic realm=\"upstream\"".to_string(),
+        ),
+        ("Via".to_string(), "1.0 upstream-proxy".to_string()),
+        ("X-Upstream-Header".to_string(), "preserved".to_string()),
+    ];
+    let context = spawn_route_proxy_context(HeaderPolicyConfig::default(), response_headers).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{}/asset", context.proxy_addr()))
+        .header("Connection", "keep-alive")
+        .header("Proxy-Connection", "close")
+        .header("TE", "trailers")
+        .header("Trailer", "Expires")
+        .header("Via", "1.0 downstream-proxy")
+        .header("Authorization", "Bearer very-secret")
+        .header("Proxy-Authorization", "Basic dXNlcjpzZWNyZXQ=")
+        .header("X-Forwarded-For", "10.0.0.1")
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let headers = response.headers();
+    assert!(headers.get("connection").is_none());
+    assert!(headers.get("proxy-connection").is_none());
+    assert!(headers.get("transfer-encoding").is_none());
+    assert!(headers.get("te").is_none());
+    assert!(headers.get("trailer").is_none());
+    assert!(headers.get("proxy-authenticate").is_none());
+    assert_eq!(
+        headers.get("via").and_then(|value| value.to_str().ok()),
+        Some("1.0 upstream-proxy, 1.1 sProx")
+    );
+    assert_eq!(
+        headers
+            .get("x-upstream-header")
+            .and_then(|value| value.to_str().ok()),
+        Some("preserved")
+    );
+
+    let log = context.upstream_log();
+    let recorded = log.lock().await;
+    let request = recorded
+        .last()
+        .expect("upstream should record at least one request");
+    let mut header_map = HashMap::new();
+    for (name, value) in &request.headers {
+        header_map.insert(name.to_ascii_lowercase(), value.clone());
+    }
+
+    assert!(!header_map.contains_key("connection"));
+    assert!(!header_map.contains_key("proxy-connection"));
+    assert!(!header_map.contains_key("te"));
+    assert!(!header_map.contains_key("trailer"));
+    assert!(!header_map.contains_key("authorization"));
+    assert!(!header_map.contains_key("proxy-authorization"));
+    assert_eq!(
+        header_map.get("x-forwarded-host"),
+        Some(&"127.0.0.1".to_string())
+    );
+    assert_eq!(
+        header_map.get("x-forwarded-for"),
+        Some(&"10.0.0.1".to_string())
+    );
+    assert_eq!(
+        header_map.get("via"),
+        Some(&"1.0 downstream-proxy, 1.1 sProx".to_string())
+    );
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_replaces_x_forwarded_for_when_configured() {
+    let policy = HeaderPolicyConfig {
+        x_forwarded_for: XForwardedForConfig::Replace,
+        ..HeaderPolicyConfig::default()
+    };
+    let context = spawn_route_proxy_context(policy, Vec::new()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{}/asset", context.proxy_addr()))
+        .header("X-Forwarded-For", "198.18.0.1")
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("via")
+            .and_then(|value| value.to_str().ok()),
+        Some("1.1 sProx")
+    );
+
+    let log = context.upstream_log();
+    let recorded = log.lock().await;
+    let request = recorded
+        .last()
+        .expect("upstream should record at least one request");
+    let mut header_map = HashMap::new();
+    for (name, value) in &request.headers {
+        header_map.insert(name.to_ascii_lowercase(), value.clone());
+    }
+
+    assert!(!header_map.contains_key("x-forwarded-for"));
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_forwards_authorization_when_allowed() {
+    let mut policy = HeaderPolicyConfig::default();
+    policy
+        .allow
+        .push(header::HeaderName::from_static("authorization"));
+    let context = spawn_route_proxy_context(policy, Vec::new()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{}/asset", context.proxy_addr()))
+        .header("Authorization", "Bearer delegated-secret")
+        .send()
+        .await
+        .expect("proxy request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let log = context.upstream_log();
+    let recorded = log.lock().await;
+    let request = recorded
+        .last()
+        .expect("upstream should record at least one request");
+    let mut header_map = HashMap::new();
+    for (name, value) in &request.headers {
+        header_map.insert(name.to_ascii_lowercase(), value.clone());
+    }
+
+    assert_eq!(
+        header_map.get("authorization"),
+        Some(&"Bearer delegated-secret".to_string())
+    );
+    assert!(!header_map.contains_key("proxy-authorization"));
+
+    context.shutdown().await;
 }
 
 #[tokio::test]
