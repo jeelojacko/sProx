@@ -28,7 +28,8 @@ use reqwest::{
     header::{
         HeaderMap as ReqwestHeaderMap, HeaderName as ReqwestHeaderName,
         HeaderValue as ReqwestHeaderValue, InvalidHeaderName as ReqwestInvalidHeaderName,
-        InvalidHeaderValue as ReqwestInvalidHeaderValue, LOCATION,
+        InvalidHeaderValue as ReqwestInvalidHeaderValue, CONTENT_LENGTH, CONTENT_RANGE, LOCATION,
+        TRANSFER_ENCODING,
     },
     Client, Method, Url,
 };
@@ -47,6 +48,7 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
     "content-range",
     "content-disposition",
     "content-encoding",
+    "transfer-encoding",
     "cache-control",
     "etag",
     "last-modified",
@@ -178,6 +180,9 @@ enum DirectStreamError {
     #[error("upstream returned status {status}")]
     UpstreamStatus { status: StatusCode },
 
+    #[error("upstream responded with status {status} but did not include required range headers")]
+    InvalidRangeResponse { status: StatusCode },
+
     #[error("failed to initialize direct stream client: {source}")]
     ClientBuild { source: reqwest::Error },
 
@@ -285,6 +290,12 @@ impl DirectStreamError {
             Self::UpstreamStatus { status } => {
                 (status, format!("upstream responded with status {status}"))
             }
+            Self::InvalidRangeResponse { status } => (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "upstream responded with status {status} but omitted required range headers"
+                ),
+            ),
             Self::RedirectLimitExceeded { limit } => (
                 StatusCode::BAD_GATEWAY,
                 format!("redirect chain exceeded {limit} hops"),
@@ -465,14 +476,35 @@ impl DirectStreamService {
 
         validate_upstream_status(get_outcome.response.status())?;
 
-        let status = StatusCode::from_u16(get_outcome.response.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
-
         let mut response_headers = HeaderMap::new();
         let mut has_accept_ranges = false;
+        let mut transfer_encoding_values: Vec<HeaderValue> = Vec::new();
+        let mut content_length_value: Option<HeaderValue> = None;
+        let mut content_range_value: Option<HeaderValue> = None;
 
         for (name, value) in get_outcome.response.headers().iter() {
             if !is_response_header_allowed(name.as_str()) {
+                continue;
+            }
+
+            if name == TRANSFER_ENCODING {
+                let header_value = HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?;
+                transfer_encoding_values.push(header_value);
+                continue;
+            }
+
+            if name == CONTENT_LENGTH {
+                let header_value = HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?;
+                content_length_value = Some(header_value);
+                continue;
+            }
+
+            if name == CONTENT_RANGE {
+                let header_value = HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?;
+                content_range_value = Some(header_value);
                 continue;
             }
 
@@ -487,6 +519,42 @@ impl DirectStreamService {
             }
 
             response_headers.append(header_name, header_value);
+        }
+
+        let upstream_status = get_outcome.response.status();
+        let status =
+            StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let expects_partial = upstream_status == reqwest::StatusCode::PARTIAL_CONTENT;
+
+        if expects_partial && content_range_value.is_none() {
+            return Err(DirectStreamError::InvalidRangeResponse { status });
+        }
+
+        if !expects_partial && content_range_value.is_some() {
+            return Err(DirectStreamError::InvalidRangeResponse { status });
+        }
+
+        if let Some(value) = content_range_value {
+            response_headers.insert(header::CONTENT_RANGE, value);
+        }
+
+        let known_length = get_outcome.response.content_length();
+
+        match known_length {
+            Some(length) => {
+                let header_value = if let Some(value) = content_length_value {
+                    value
+                } else {
+                    HeaderValue::from_str(&length.to_string())
+                        .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?
+                };
+                response_headers.insert(header::CONTENT_LENGTH, header_value);
+            }
+            None => {
+                for value in transfer_encoding_values {
+                    response_headers.append(header::TRANSFER_ENCODING, value);
+                }
+            }
         }
 
         if !has_accept_ranges {
