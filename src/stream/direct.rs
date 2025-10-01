@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io, time::Duration};
+use std::{collections::HashMap, io, net::IpAddr};
 
 use axum::{
     body::Body,
@@ -13,37 +13,25 @@ use axum::{
     },
 };
 use futures::TryStreamExt;
+use ipnet::IpNet;
+use once_cell::sync::Lazy;
 use reqwest::{
     header::{
         HeaderMap as ReqwestHeaderMap, HeaderName as ReqwestHeaderName,
         HeaderValue as ReqwestHeaderValue, InvalidHeaderName as ReqwestInvalidHeaderName,
-        InvalidHeaderValue as ReqwestInvalidHeaderValue,
+        InvalidHeaderValue as ReqwestInvalidHeaderValue, LOCATION,
     },
-    Client, Url,
+    Client, Method, Url,
 };
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::net::lookup_host;
 use url::form_urlencoded;
 
-use crate::state::AppState;
+use crate::state::{AppState, DirectStreamSettings};
 
 const DIRECT_STREAM_PASSWORD_HEADER: &str = "x-sprox-api-password";
 const DIRECT_STREAM_PASSWORD_QUERY_KEY: &str = "api_password";
-
-const REQUEST_HEADER_ALLOWLIST: &[&str] = &[
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "cache-control",
-    "pragma",
-    "range",
-    "if-range",
-    "if-none-match",
-    "if-modified-since",
-    "user-agent",
-    "referer",
-    "origin",
-];
 
 const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
     "content-type",
@@ -60,6 +48,40 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
     "pragma",
     "accept-ranges",
 ];
+
+const MAX_REDIRECTS: usize = 10;
+
+static RESTRICTED_NETWORKS: Lazy<Vec<IpNet>> = Lazy::new(|| {
+    vec![
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "255.255.255.255/32",
+        "::/128",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+        "2001:db8::/32",
+    ]
+    .into_iter()
+    .map(|entry| {
+        entry
+            .parse()
+            .expect("static IP network definitions are valid")
+    })
+    .collect()
+});
 
 #[derive(Debug, Deserialize)]
 pub struct DirectStreamQuery {
@@ -85,6 +107,25 @@ enum DirectStreamError {
         source: url::ParseError,
     },
 
+    #[error("destination url uses unsupported scheme `{scheme}`")]
+    UnsupportedScheme { scheme: String },
+
+    #[error("destination url `{url}` is missing a host component")]
+    MissingHost { url: String },
+
+    #[error("failed to resolve host `{host}`: {source}")]
+    HostResolution {
+        host: String,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("destination `{url}` is not allowlisted")]
+    DestinationNotAllowlisted { url: String },
+
+    #[error("destination `{url}` resolved to restricted address `{ip}`")]
+    DestinationAddressRestricted { url: String, ip: IpAddr },
+
     #[error("invalid override header name `{name}`")]
     InvalidOverrideHeaderName { name: String },
 
@@ -94,6 +135,9 @@ enum DirectStreamError {
         #[source]
         source: ReqwestInvalidHeaderValue,
     },
+
+    #[error("override header `{name}` is not allowlisted")]
+    OverrideHeaderNotAllowed { name: String },
 
     #[error("invalid downstream header name `{name}`")]
     InvalidForwardHeaderName {
@@ -135,6 +179,22 @@ enum DirectStreamError {
 
     #[error("failed to initialize direct stream client: {source}")]
     ClientBuild { source: reqwest::Error },
+
+    #[error("redirect chain exceeded {limit} hops")]
+    RedirectLimitExceeded { limit: usize },
+
+    #[error("redirect response missing location header")]
+    RedirectLocationMissing,
+
+    #[error("redirect target `{location}` is invalid: {source}")]
+    InvalidRedirectLocation {
+        location: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("redirect target contains invalid characters")]
+    InvalidRedirectEncoding,
 }
 
 impl DirectStreamError {
@@ -148,6 +208,26 @@ impl DirectStreamError {
                 StatusCode::BAD_REQUEST,
                 format!("invalid destination url: {source}"),
             ),
+            Self::UnsupportedScheme { scheme } => (
+                StatusCode::BAD_REQUEST,
+                format!("destination url uses unsupported scheme `{scheme}`"),
+            ),
+            Self::MissingHost { url } => (
+                StatusCode::BAD_REQUEST,
+                format!("destination url `{url}` must include a host"),
+            ),
+            Self::HostResolution { host, source } => (
+                StatusCode::BAD_REQUEST,
+                format!("failed to resolve `{host}`: {source}"),
+            ),
+            Self::DestinationNotAllowlisted { url } => (
+                StatusCode::FORBIDDEN,
+                format!("destination `{url}` is not allowlisted"),
+            ),
+            Self::DestinationAddressRestricted { url, ip } => (
+                StatusCode::FORBIDDEN,
+                format!("destination `{url}` resolved to restricted address `{ip}`"),
+            ),
             Self::InvalidOverrideHeaderName { name } => (
                 StatusCode::BAD_REQUEST,
                 format!("header override `{name}` is not allowed"),
@@ -155,6 +235,10 @@ impl DirectStreamError {
             Self::InvalidOverrideHeaderValue { name, .. } => (
                 StatusCode::BAD_REQUEST,
                 format!("header override `{name}` has an invalid value"),
+            ),
+            Self::OverrideHeaderNotAllowed { name } => (
+                StatusCode::BAD_REQUEST,
+                format!("header override `{name}` is not allowlisted"),
             ),
             Self::InvalidForwardHeaderName { name, .. } => (
                 StatusCode::BAD_REQUEST,
@@ -204,6 +288,22 @@ impl DirectStreamError {
             Self::UpstreamStatus { status } => {
                 (status, format!("upstream responded with status {status}"))
             }
+            Self::RedirectLimitExceeded { limit } => (
+                StatusCode::BAD_GATEWAY,
+                format!("redirect chain exceeded {limit} hops"),
+            ),
+            Self::RedirectLocationMissing => (
+                StatusCode::BAD_GATEWAY,
+                "upstream redirect did not include a location header".to_string(),
+            ),
+            Self::InvalidRedirectLocation { location, source } => (
+                StatusCode::BAD_GATEWAY,
+                format!("redirect location `{location}` is invalid: {source}"),
+            ),
+            Self::InvalidRedirectEncoding => (
+                StatusCode::BAD_GATEWAY,
+                "redirect location header is not valid UTF-8".to_string(),
+            ),
         }
     }
 }
@@ -235,15 +335,16 @@ pub async fn handle_proxy_stream(
     let upstream_url = Url::parse(&query.d)
         .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
 
+    let settings = state.direct_stream_settings().cloned().unwrap_or_default();
+
     let overrides = extract_header_overrides(&uri);
-    let upstream_headers = prepare_upstream_headers(&downstream_headers, &overrides)
+    let upstream_headers = prepare_upstream_headers(&downstream_headers, &overrides, &settings)
         .map_err(|error| error.into_response())?;
 
     let client = state
         .direct_stream_client()
         .map_err(|source| DirectStreamError::ClientBuild { source }.into_response())?;
-    let request_timeout = state.direct_stream_request_timeout();
-    let service = DirectStreamService::new(client, request_timeout);
+    let service = DirectStreamService::new(client, settings);
 
     service
         .stream(upstream_url, upstream_headers)
@@ -274,11 +375,12 @@ fn extract_header_overrides(uri: &Uri) -> Vec<(String, String)> {
 fn prepare_upstream_headers(
     downstream: &HeaderMap,
     overrides: &[(String, String)],
+    settings: &DirectStreamSettings,
 ) -> Result<ReqwestHeaderMap, DirectStreamError> {
     let mut sanitized = ReqwestHeaderMap::new();
 
     for (name, value) in downstream.iter() {
-        if !is_request_header_allowed(name.as_str()) {
+        if !settings.is_request_header_allowed(name.as_str()) {
             continue;
         }
 
@@ -307,8 +409,10 @@ fn prepare_upstream_headers(
             }
         })?;
 
-        if !is_request_header_allowed(header_name.as_str()) {
-            continue;
+        if !settings.is_request_header_allowed(header_name.as_str()) {
+            return Err(DirectStreamError::OverrideHeaderNotAllowed {
+                name: header_name.to_string(),
+            });
         }
 
         let header_value = ReqwestHeaderValue::from_str(raw_value).map_err(|source| {
@@ -324,12 +428,6 @@ fn prepare_upstream_headers(
     Ok(sanitized)
 }
 
-fn is_request_header_allowed(name: &str) -> bool {
-    REQUEST_HEADER_ALLOWLIST
-        .iter()
-        .any(|allowed| name.eq_ignore_ascii_case(allowed))
-}
-
 fn is_response_header_allowed(name: &str) -> bool {
     RESPONSE_HEADER_ALLOWLIST
         .iter()
@@ -339,15 +437,12 @@ fn is_response_header_allowed(name: &str) -> bool {
 #[derive(Clone)]
 struct DirectStreamService {
     client: Client,
-    request_timeout: Duration,
+    settings: DirectStreamSettings,
 }
 
 impl DirectStreamService {
-    fn new(client: Client, request_timeout: Duration) -> Self {
-        Self {
-            client,
-            request_timeout,
-        }
+    fn new(client: Client, settings: DirectStreamSettings) -> Self {
+        Self { client, settings }
     }
 
     async fn stream(
@@ -355,15 +450,10 @@ impl DirectStreamService {
         url: Url,
         headers: ReqwestHeaderMap,
     ) -> Result<Response<Body>, DirectStreamError> {
-        let head_status = self
-            .client
-            .head(url.clone())
-            .headers(headers.clone())
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(|source| DirectStreamError::UpstreamRequest { source })?
-            .status();
+        let head_outcome = self
+            .send_with_redirects(Method::HEAD, url, headers.clone())
+            .await?;
+        let head_status = head_outcome.response.status();
 
         if !matches!(
             head_status,
@@ -372,24 +462,19 @@ impl DirectStreamService {
             validate_upstream_status(head_status)?;
         }
 
-        let get_response = self
-            .client
-            .get(url)
-            .headers(headers)
-            .timeout(self.request_timeout)
-            .send()
-            .await
-            .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
+        let get_outcome = self
+            .send_with_redirects(Method::GET, head_outcome.final_url, headers)
+            .await?;
 
-        validate_upstream_status(get_response.status())?;
+        validate_upstream_status(get_outcome.response.status())?;
 
-        let status =
-            StatusCode::from_u16(get_response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let status = StatusCode::from_u16(get_outcome.response.status().as_u16())
+            .unwrap_or(StatusCode::BAD_GATEWAY);
 
         let mut response_headers = HeaderMap::new();
         let mut has_accept_ranges = false;
 
-        for (name, value) in get_response.headers().iter() {
+        for (name, value) in get_outcome.response.headers().iter() {
             if !is_response_header_allowed(name.as_str()) {
                 continue;
             }
@@ -411,7 +496,8 @@ impl DirectStreamService {
             response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         }
 
-        let stream = get_response
+        let stream = get_outcome
+            .response
             .bytes_stream()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error));
 
@@ -422,6 +508,136 @@ impl DirectStreamService {
 
         Ok(response)
     }
+
+    async fn send_with_redirects(
+        &self,
+        method: Method,
+        url: Url,
+        headers: ReqwestHeaderMap,
+    ) -> Result<RequestOutcome, DirectStreamError> {
+        let mut current_url = url;
+        let mut redirects = 0;
+
+        loop {
+            self.validate_destination(&current_url).await?;
+
+            let response = self
+                .client
+                .request(method.clone(), current_url.clone())
+                .headers(headers.clone())
+                .timeout(self.settings.request_timeout())
+                .send()
+                .await
+                .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
+
+            if let Some(next_url) = self.extract_redirect(&current_url, &response)? {
+                redirects += 1;
+                if redirects > MAX_REDIRECTS {
+                    return Err(DirectStreamError::RedirectLimitExceeded {
+                        limit: MAX_REDIRECTS,
+                    });
+                }
+
+                current_url = next_url;
+                continue;
+            }
+
+            return Ok(RequestOutcome {
+                response,
+                final_url: current_url,
+            });
+        }
+    }
+
+    async fn validate_destination(&self, url: &Url) -> Result<(), DirectStreamError> {
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(DirectStreamError::UnsupportedScheme {
+                scheme: scheme.to_string(),
+            });
+        }
+
+        if !self.settings.allowlist().allows(url) {
+            return Err(DirectStreamError::DestinationNotAllowlisted {
+                url: url.to_string(),
+            });
+        }
+
+        match url.host() {
+            Some(url::Host::Domain(domain)) => {
+                let port =
+                    url.port_or_known_default()
+                        .ok_or_else(|| DirectStreamError::MissingHost {
+                            url: url.to_string(),
+                        })?;
+
+                let addrs: Vec<_> = lookup_host((domain, port))
+                    .await
+                    .map_err(|source| DirectStreamError::HostResolution {
+                        host: domain.to_string(),
+                        source,
+                    })?
+                    .collect();
+
+                for addr in addrs {
+                    self.ensure_ip_allowed(url, addr.ip())?;
+                }
+            }
+            Some(url::Host::Ipv4(addr)) => {
+                self.ensure_ip_allowed(url, IpAddr::V4(addr))?;
+            }
+            Some(url::Host::Ipv6(addr)) => {
+                self.ensure_ip_allowed(url, IpAddr::V6(addr))?;
+            }
+            None => {
+                return Err(DirectStreamError::MissingHost {
+                    url: url.to_string(),
+                })
+            }
+        }
+
+        Ok(())
+    }
+
+    fn ensure_ip_allowed(&self, url: &Url, ip: IpAddr) -> Result<(), DirectStreamError> {
+        if is_ip_restricted(&ip) {
+            return Err(DirectStreamError::DestinationAddressRestricted {
+                url: url.to_string(),
+                ip,
+            });
+        }
+
+        Ok(())
+    }
+
+    fn extract_redirect(
+        &self,
+        current: &Url,
+        response: &reqwest::Response,
+    ) -> Result<Option<Url>, DirectStreamError> {
+        if !response.status().is_redirection() {
+            return Ok(None);
+        }
+
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .ok_or(DirectStreamError::RedirectLocationMissing)?
+            .to_str()
+            .map_err(|_| DirectStreamError::InvalidRedirectEncoding)?
+            .to_owned();
+
+        let next = current
+            .join(&location)
+            .map_err(|source| DirectStreamError::InvalidRedirectLocation { location, source })?;
+
+        Ok(Some(next))
+    }
+}
+
+struct RequestOutcome {
+    response: reqwest::Response,
+    final_url: Url,
 }
 
 fn validate_upstream_status(status: reqwest::StatusCode) -> Result<(), DirectStreamError> {
@@ -431,5 +647,22 @@ fn validate_upstream_status(status: reqwest::StatusCode) -> Result<(), DirectStr
         Err(DirectStreamError::UpstreamStatus {
             status: StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
         })
+    }
+}
+
+fn is_ip_restricted(ip: &IpAddr) -> bool {
+    if RESTRICTED_NETWORKS.iter().any(|net| net.contains(ip)) {
+        return true;
+    }
+
+    match ip {
+        IpAddr::V4(addr) => {
+            addr.is_private()
+                || addr.is_link_local()
+                || addr.is_broadcast()
+                || addr.is_documentation()
+                || addr.is_unspecified()
+        }
+        IpAddr::V6(addr) => addr.is_multicast() || addr.is_unspecified(),
     }
 }

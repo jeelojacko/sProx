@@ -2,12 +2,28 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use globset::{Glob, GlobMatcher};
 use once_cell::sync::OnceCell;
-use reqwest::{Client, Proxy};
+use reqwest::{redirect::Policy as RedirectPolicy, Client, Proxy};
 use tokio::sync::RwLock;
 use url::Url;
 
 use crate::routing::RoutingEngine;
+
+pub(crate) const DIRECT_STREAM_REQUEST_HEADER_ALLOWLIST: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "cache-control",
+    "pragma",
+    "range",
+    "if-range",
+    "if-none-match",
+    "if-modified-since",
+    "user-agent",
+    "referer",
+    "origin",
+];
 
 /// Identifier used to look up cached client metadata.
 pub type ClientId = String;
@@ -134,12 +150,13 @@ impl Default for RateLimitConfig {
 }
 
 /// Configuration applied to the direct stream proxy client.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct DirectStreamSettings {
     proxy_url: Option<Url>,
     api_password: Option<String>,
     request_timeout: Duration,
     response_buffer_bytes: usize,
+    allowlist: DirectStreamAllowlist,
 }
 
 impl DirectStreamSettings {
@@ -168,6 +185,21 @@ impl DirectStreamSettings {
     pub fn response_buffer_bytes(&self) -> usize {
         self.response_buffer_bytes
     }
+
+    pub fn allowlist(&self) -> &DirectStreamAllowlist {
+        &self.allowlist
+    }
+
+    pub fn with_allowlist(mut self, allowlist: DirectStreamAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
+    }
+
+    pub fn is_request_header_allowed(&self, name: &str) -> bool {
+        DIRECT_STREAM_REQUEST_HEADER_ALLOWLIST
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed))
+    }
 }
 
 impl Default for DirectStreamSettings {
@@ -177,6 +209,7 @@ impl Default for DirectStreamSettings {
             api_password: None,
             request_timeout: Self::default_request_timeout(),
             response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
+            allowlist: DirectStreamAllowlist::default(),
         }
     }
 }
@@ -189,7 +222,126 @@ impl From<crate::config::DirectStreamConfig> for DirectStreamSettings {
             api_password: value.api_password,
             request_timeout: value.request_timeout,
             response_buffer_bytes: value.response_buffer_bytes,
+            allowlist: value.allowlist.into(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DirectStreamAllowlist {
+    rules: Vec<CompiledDirectStreamAllowRule>,
+}
+
+impl DirectStreamAllowlist {
+    pub fn allows(&self, url: &Url) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+        let path = url.path();
+        let scheme = url.scheme();
+
+        self.rules
+            .iter()
+            .any(|rule| rule.matches(&normalized_host, path, scheme))
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::DirectStreamAllowlist> for DirectStreamAllowlist {
+    fn from(value: crate::config::DirectStreamAllowlist) -> Self {
+        let rules = value
+            .rules
+            .into_iter()
+            .map(CompiledDirectStreamAllowRule::from)
+            .collect();
+
+        Self { rules }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompiledDirectStreamAllowRule {
+    domain: String,
+    schemes: AllowedSchemes,
+    path_matchers: Vec<GlobMatcher>,
+}
+
+impl CompiledDirectStreamAllowRule {
+    fn matches(&self, host: &str, path: &str, scheme: &str) -> bool {
+        if self.domain != host {
+            return false;
+        }
+
+        if !self.schemes.allows(scheme) {
+            return false;
+        }
+
+        if self.path_matchers.is_empty() {
+            return true;
+        }
+
+        self.path_matchers
+            .iter()
+            .any(|matcher| matcher.is_match(path))
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<crate::config::DirectStreamAllowRule> for CompiledDirectStreamAllowRule {
+    fn from(value: crate::config::DirectStreamAllowRule) -> Self {
+        let path_matchers = value
+            .path_globs
+            .iter()
+            .map(|pattern| {
+                Glob::new(pattern)
+                    .expect("path globs validated during configuration parsing")
+                    .compile_matcher()
+            })
+            .collect();
+
+        Self {
+            domain: value.domain,
+            schemes: AllowedSchemes::from(value.schemes),
+            path_matchers,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct AllowedSchemes {
+    http: bool,
+    https: bool,
+}
+
+impl AllowedSchemes {
+    fn allows(&self, scheme: &str) -> bool {
+        match scheme {
+            "http" => self.http,
+            "https" => self.https,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(feature = "config-loader")]
+impl From<Vec<crate::config::DirectStreamScheme>> for AllowedSchemes {
+    fn from(value: Vec<crate::config::DirectStreamScheme>) -> Self {
+        let mut schemes = Self::default();
+
+        for scheme in value {
+            match scheme {
+                crate::config::DirectStreamScheme::Http => schemes.http = true,
+                crate::config::DirectStreamScheme::Https => schemes.https = true,
+            }
+        }
+
+        schemes
     }
 }
 
@@ -227,7 +379,9 @@ impl DirectStreamState {
 }
 
 fn build_direct_stream_client(settings: &DirectStreamSettings) -> Result<Client, reqwest::Error> {
-    let mut builder = Client::builder().timeout(settings.request_timeout());
+    let mut builder = Client::builder()
+        .timeout(settings.request_timeout())
+        .redirect(RedirectPolicy::none());
 
     if let Some(proxy_url) = settings.proxy_url() {
         builder = builder.proxy(Proxy::all(proxy_url.as_str())?);
@@ -329,6 +483,11 @@ impl AppState {
         self.direct_stream
             .as_ref()
             .and_then(|state| state.settings().api_password())
+    }
+
+    /// Returns the configured direct stream settings when available.
+    pub fn direct_stream_settings(&self) -> Option<&DirectStreamSettings> {
+        self.direct_stream.as_ref().map(|state| state.settings())
     }
 
     /// Returns the request timeout applied to direct stream requests.
@@ -448,6 +607,7 @@ mod tests {
             api_password: Some("super-secret".into()),
             request_timeout: Duration::from_secs(10),
             response_buffer_bytes: 131_072,
+            allowlist: DirectStreamAllowlist::default(),
         };
 
         let state = AppState::new().with_direct_stream_settings(settings.clone());

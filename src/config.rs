@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use config as config_rs;
+use globset::Glob;
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -21,6 +22,7 @@ pub struct DirectStreamConfig {
     pub api_password: Option<String>,
     pub request_timeout: Duration,
     pub response_buffer_bytes: usize,
+    pub allowlist: DirectStreamAllowlist,
 }
 
 impl DirectStreamConfig {
@@ -28,6 +30,10 @@ impl DirectStreamConfig {
 
     pub fn default_request_timeout() -> Duration {
         Duration::from_secs(30)
+    }
+
+    pub fn allowlist(&self) -> &DirectStreamAllowlist {
+        &self.allowlist
     }
 }
 
@@ -38,6 +44,46 @@ impl Default for DirectStreamConfig {
             api_password: None,
             request_timeout: Self::default_request_timeout(),
             response_buffer_bytes: Self::DEFAULT_RESPONSE_BUFFER_BYTES,
+            allowlist: DirectStreamAllowlist::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DirectStreamAllowlist {
+    pub rules: Vec<DirectStreamAllowRule>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirectStreamAllowRule {
+    pub domain: String,
+    pub schemes: Vec<DirectStreamScheme>,
+    pub path_globs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectStreamScheme {
+    Http,
+    Https,
+}
+
+impl DirectStreamScheme {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+impl std::str::FromStr for DirectStreamScheme {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "http" => Ok(Self::Http),
+            "https" => Ok(Self::Https),
+            _ => Err(()),
         }
     }
 }
@@ -152,6 +198,17 @@ struct RawDirectStream {
     request_timeout_ms: Option<u64>,
     #[serde(default)]
     response_buffer_bytes: Option<usize>,
+    #[serde(default)]
+    allowlist: Vec<RawDirectStreamAllowRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDirectStreamAllowRule {
+    domain: String,
+    #[serde(default)]
+    schemes: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,8 +452,89 @@ impl RawDirectStream {
                 buffer_size_from_bytes(buffer_bytes, format!("{context}.response_buffer_bytes"))?;
         }
 
+        config.allowlist = parse_direct_stream_allowlist(self.allowlist, context)?;
+
         Ok(config)
     }
+}
+
+fn parse_direct_stream_allowlist(
+    rules: Vec<RawDirectStreamAllowRule>,
+    context: &str,
+) -> Result<DirectStreamAllowlist, ConfigError> {
+    let mut parsed = Vec::with_capacity(rules.len());
+
+    for (idx, rule) in rules.into_iter().enumerate() {
+        let rule_context = format!("{context}.allowlist[{idx}]");
+        let domain = rule.domain.trim();
+        if domain.is_empty() {
+            return Err(validation_error(
+                format!("{rule_context}.domain"),
+                "domain must not be empty",
+            ));
+        }
+
+        let mut schemes = Vec::new();
+        if rule.schemes.is_empty() {
+            schemes.push(DirectStreamScheme::Https);
+        } else {
+            for (scheme_idx, scheme) in rule.schemes.into_iter().enumerate() {
+                let normalized = scheme.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    return Err(validation_error(
+                        format!("{rule_context}.schemes[{scheme_idx}]"),
+                        "scheme must not be empty",
+                    ));
+                }
+
+                let Ok(value) = normalized.parse::<DirectStreamScheme>() else {
+                    return Err(validation_error(
+                        format!("{rule_context}.schemes[{scheme_idx}]"),
+                        format!("unsupported scheme `{scheme}`"),
+                    ));
+                };
+
+                if !schemes.contains(&value) {
+                    schemes.push(value);
+                }
+            }
+        }
+
+        let mut path_globs = Vec::with_capacity(rule.paths.len());
+        for (path_idx, pattern) in rule.paths.into_iter().enumerate() {
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                return Err(validation_error(
+                    format!("{rule_context}.paths[{path_idx}]"),
+                    "path glob must not be empty",
+                ));
+            }
+
+            if !trimmed.starts_with('/') {
+                return Err(validation_error(
+                    format!("{rule_context}.paths[{path_idx}]"),
+                    "path glob must start with `/`",
+                ));
+            }
+
+            Glob::new(trimmed).map_err(|source| {
+                validation_error(
+                    format!("{rule_context}.paths[{path_idx}]"),
+                    format!("invalid glob `{trimmed}`: {source}"),
+                )
+            })?;
+
+            path_globs.push(trimmed.to_owned());
+        }
+
+        parsed.push(DirectStreamAllowRule {
+            domain: domain.to_ascii_lowercase(),
+            schemes,
+            path_globs,
+        });
+    }
+
+    Ok(DirectStreamAllowlist { rules: parsed })
 }
 
 fn parse_listener(raw: RawListener, context: &str) -> Result<ListenerConfig, ConfigError> {
@@ -775,6 +913,7 @@ mod tests {
                 api_password: Some("secret".into()),
                 request_timeout_ms: Some(4500),
                 response_buffer_bytes: Some(32_768),
+                allowlist: Vec::new(),
             }),
             routes: vec![sample_route()],
         };
