@@ -5,6 +5,16 @@ routes:
     listen:
       host: "0.0.0.0"
       port: 8080
+      tls:
+        enabled: false             # Enable to expose this listener via HTTPS.
+        certificate_path: "config/tls/dev-cert.pem" # Path to the PEM-encoded certificate chain.
+        private_key_path: "config/tls/dev-key.pem"  # Path to the PEM-encoded private key.
+        watch_for_changes: true    # Reload TLS material automatically when files change.
+        acme:
+          enabled: false           # When true the cache directory will be prepared for ACME clients.
+          contact_emails: ["admin@example.com"]
+          directory_url: null      # Optional custom ACME directory endpoint.
+          cache_path: "var/acme"   # Directory where ACME clients can store account data.
     host_patterns:
       - "vod-edge.example.com"
       - "*.vod.example.com"
@@ -62,3 +72,12 @@ direct_stream:
   api_password: null             # Optional shared secret required when invoking the endpoint.
   request_timeout_ms: 30000      # Timeout applied to upstream requests issued by the direct client.
   response_buffer_bytes: 65536   # Initial HTTP/2 window sizes used when streaming responses.
+cors:
+  allow_origins:
+    - "https://app.example.com"
+  allow_methods:
+    - GET
+    - OPTIONS
+  allow_headers:
+    - Content-Type
+    - Authorization

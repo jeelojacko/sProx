@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tower::retry::budget::Budget;
 use url::Url;
 
-use crate::config::Config;
+use crate::config::{Config, CorsConfig};
 use crate::routing::{PortRange, RouteDefinition, RoutingEngine};
 
 pub(crate) const DIRECT_STREAM_REQUEST_HEADER_ALLOWLIST: &[&str] = &[
@@ -842,6 +842,7 @@ pub struct AppState {
     http_client: Client,
     direct_stream: Option<DirectStreamState>,
     sensitive_logging: SensitiveLoggingConfig,
+    cors: Option<CorsConfig>,
 }
 
 /// Shared handle that allows the application state to be swapped atomically at runtime.
@@ -908,6 +909,7 @@ impl AppState {
             http_client: Client::new(),
             direct_stream: None,
             sensitive_logging: SensitiveLoggingConfig::default(),
+            cors: None,
         }
     }
 
@@ -986,6 +988,7 @@ impl AppState {
         }
 
         state = state.with_sensitive_logging(config.sensitive_logging.clone().into());
+        state = state.with_cors(config.cors.clone());
 
         Ok(state)
     }
@@ -1035,6 +1038,17 @@ impl AppState {
     pub fn with_sensitive_logging(mut self, config: SensitiveLoggingConfig) -> Self {
         self.sensitive_logging = config;
         self
+    }
+
+    /// Applies CORS configuration to the state.
+    pub fn with_cors(mut self, cors: Option<CorsConfig>) -> Self {
+        self.cors = cors;
+        self
+    }
+
+    /// Returns the configured CORS settings, when available.
+    pub fn cors_config(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
     }
 
     /// Returns the configured proxy URL for direct stream requests when present.
@@ -1107,6 +1121,7 @@ impl Default for AppState {
             http_client: Client::new(),
             direct_stream: None,
             sensitive_logging: SensitiveLoggingConfig::default(),
+            cors: None,
         }
     }
 }

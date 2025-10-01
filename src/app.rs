@@ -34,12 +34,14 @@ use crate::state::AppState;
 #[cfg(feature = "drm")]
 use crate::stream::dash;
 use crate::{
+    config::CorsConfig,
     proxy::{self, ProxyError},
     state::{RateLimitConfig, SensitiveLoggingConfig, SharedAppState},
     stream::direct::handle_proxy_stream,
 };
 use futures::future::BoxFuture;
 use tower::limit::rate::{RateLimit, RateLimitLayer as TowerRateLimitLayer};
+use tower_http::cors::{Any, CorsLayer};
 #[cfg(feature = "telemetry")]
 use tracing::error;
 
@@ -56,6 +58,7 @@ pub fn build_router(state: SharedAppState) -> Router {
 
     #[cfg(feature = "telemetry")]
     let sensitive_logging = state.with_current(|state| state.sensitive_logging().clone());
+    let cors_config = state.with_current(|state| state.cors_config().cloned());
 
     let router = Router::new()
         .route("/health", get(health_check))
@@ -72,6 +75,12 @@ pub fn build_router(state: SharedAppState) -> Router {
         .fallback(proxy_fallback)
         .with_state(state)
         .layer(rate_limit_layer);
+
+    let router = if let Some(cors) = cors_config {
+        router.layer(cors_layer_from_config(&cors))
+    } else {
+        router
+    };
 
     #[cfg(feature = "telemetry")]
     let router = router.layer({
@@ -97,6 +106,36 @@ pub fn build_router(state: SharedAppState) -> Router {
     });
 
     router
+}
+
+fn cors_layer_from_config(config: &CorsConfig) -> CorsLayer {
+    use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin};
+
+    let allow_any_origin = config
+        .allow_origins
+        .iter()
+        .any(|value| value.as_bytes() == b"*");
+    let mut layer = CorsLayer::new();
+
+    if config.allow_origins.is_empty() || allow_any_origin {
+        layer = layer.allow_origin(Any);
+    } else {
+        layer = layer.allow_origin(AllowOrigin::list(config.allow_origins.clone()));
+    }
+
+    if config.allow_methods.is_empty() {
+        layer = layer.allow_methods(Any);
+    } else {
+        layer = layer.allow_methods(AllowMethods::list(config.allow_methods.clone()));
+    }
+
+    if config.allow_headers.is_empty() {
+        layer = layer.allow_headers(Any);
+    } else {
+        layer = layer.allow_headers(AllowHeaders::list(config.allow_headers.clone()));
+    }
+
+    layer
 }
 
 /// Basic health-check handler used for readiness probes.
