@@ -383,6 +383,10 @@ fn build_direct_stream_client(settings: &DirectStreamSettings) -> Result<Client,
         .timeout(settings.request_timeout())
         .redirect(RedirectPolicy::none());
 
+    let resolver = Arc::new(crate::stream::direct::RestrictedDnsResolver::new());
+
+    builder = builder.dns_resolver(resolver);
+
     if let Some(proxy_url) = settings.proxy_url() {
         builder = builder.proxy(Proxy::all(proxy_url.as_str())?);
     }
