@@ -5,7 +5,7 @@ use std::{collections::HashMap, env, io, net::SocketAddr, sync::Arc, time::Durat
 use axum::{
     body::Body as AxumBody,
     extract::State as AxumState,
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode as AxumStatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode as AxumStatusCode, Uri},
     response::Response as AxumResponse,
     routing::get,
     Router,
@@ -18,7 +18,11 @@ use tokio::{
 };
 use url::Url;
 
-use sProx::config::{Config, ListenerConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig};
+use sProx::config::{
+    Config, DirectStreamAllowRule, DirectStreamAllowlist, DirectStreamConfig, DirectStreamScheme,
+    ListenerConfig, RouteConfig, Socks5Config, TlsConfig, UpstreamConfig,
+};
+use sProx::state::{AppState, DirectStreamSettings};
 
 #[tokio::test]
 async fn health_endpoint_returns_success() {
@@ -257,9 +261,122 @@ async fn proxy_stream_respects_range_and_header_overrides() {
     context.shutdown().await;
 }
 
+#[tokio::test]
+async fn direct_stream_rejects_non_allowlisted_destination() {
+    let context = spawn_stream_test_with_allowlist(b"abcdef".to_vec(), |_addr| {
+        DirectStreamAllowlist { rules: Vec::new() }
+    })
+    .await;
+
+    let mut proxy_url =
+        Url::parse(&format!("http://{}/proxy/stream", context.app_addr())).expect("proxy url");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_blocks_private_ipv4_destination() {
+    let context =
+        spawn_stream_test_with_allowlist(b"1234567890".to_vec(), |_addr| DirectStreamAllowlist {
+            rules: vec![DirectStreamAllowRule {
+                domain: "192.168.0.1".into(),
+                schemes: vec![DirectStreamScheme::Http],
+                path_globs: vec!["/**".into()],
+            }],
+        })
+        .await;
+
+    let mut proxy_url =
+        Url::parse(&format!("http://{}/proxy/stream", context.app_addr())).expect("proxy url");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", "http://192.168.0.1/asset");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_follows_allowlisted_redirect_chain() {
+    let body = b"redirect-body".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+
+    let redirect_target = format!("http://{}/asset", context.upstream_addr());
+    context
+        .add_upstream_redirect("/redirect", redirect_target)
+        .await;
+
+    let mut proxy_url =
+        Url::parse(&format!("http://{}/proxy/stream", context.app_addr())).expect("proxy url");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/redirect", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes, body);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_blocks_redirect_outside_allowlist() {
+    let body = b"block-redirect".to_vec();
+    let context = spawn_stream_test(body).await;
+
+    context
+        .add_upstream_redirect("/redirect", "http://blocked.example/asset".into())
+        .await;
+
+    let mut proxy_url =
+        Url::parse(&format!("http://{}/proxy/stream", context.app_addr())).expect("proxy url");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/redirect", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    context.shutdown().await;
+}
+
 struct StreamTestContext {
     app_addr: SocketAddr,
     upstream_addr: SocketAddr,
+    upstream_state: UpstreamState,
     upstream_log: Arc<Mutex<Vec<RecordedRequest>>>,
     app_shutdown: Option<oneshot::Sender<()>>,
     upstream_shutdown: Option<oneshot::Sender<()>>,
@@ -280,6 +397,10 @@ impl StreamTestContext {
         Arc::clone(&self.upstream_log)
     }
 
+    async fn add_upstream_redirect(&self, path: &str, target: String) {
+        self.upstream_state.add_redirect(path, target).await;
+    }
+
     async fn shutdown(mut self) {
         if let Some(tx) = self.app_shutdown.take() {
             let _ = tx.send(());
@@ -294,11 +415,31 @@ impl StreamTestContext {
 }
 
 async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
+    spawn_stream_test_with_allowlist(body, |addr| {
+        let domain = addr.ip().to_string();
+        DirectStreamAllowlist {
+            rules: vec![DirectStreamAllowRule {
+                domain,
+                schemes: vec![DirectStreamScheme::Http],
+                path_globs: vec!["/**".into()],
+            }],
+        }
+    })
+    .await
+}
+
+async fn spawn_stream_test_with_allowlist<F>(
+    body: Vec<u8>,
+    allowlist_builder: F,
+) -> StreamTestContext
+where
+    F: Fn(SocketAddr) -> DirectStreamAllowlist,
+{
     let upstream_state = UpstreamState::new(body);
     let upstream_log = upstream_state.log.clone();
     let upstream_router = Router::new()
-        .route("/asset", get(upstream_handler).head(upstream_handler))
-        .with_state(upstream_state);
+        .route("/*path", get(upstream_handler).head(upstream_handler))
+        .with_state(upstream_state.clone());
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -315,7 +456,13 @@ async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
             .await
     });
 
-    let app_state = AppState::new();
+    let direct_stream = DirectStreamConfig {
+        allowlist: allowlist_builder(upstream_addr),
+        ..DirectStreamConfig::default()
+    };
+    let settings: DirectStreamSettings = direct_stream.into();
+
+    let app_state = AppState::new().with_direct_stream_settings(settings);
     let router = app::build_router(app_state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -335,6 +482,7 @@ async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
     StreamTestContext {
         app_addr,
         upstream_addr,
+        upstream_state,
         upstream_log,
         app_shutdown: Some(app_shutdown),
         upstream_shutdown: Some(upstream_shutdown),
@@ -347,6 +495,7 @@ async fn spawn_stream_test(body: Vec<u8>) -> StreamTestContext {
 struct UpstreamState {
     body: Arc<Vec<u8>>,
     log: Arc<Mutex<Vec<RecordedRequest>>>,
+    redirects: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl UpstreamState {
@@ -354,7 +503,16 @@ impl UpstreamState {
         Self {
             body: Arc::new(body),
             log: Arc::new(Mutex::new(Vec::new())),
+            redirects: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn add_redirect(&self, path: &str, target: String) {
+        self.redirects.lock().await.insert(path.to_string(), target);
+    }
+
+    async fn redirect_target(&self, path: &str) -> Option<String> {
+        self.redirects.lock().await.get(path).cloned()
     }
 }
 
@@ -368,6 +526,7 @@ async fn upstream_handler(
     AxumState(state): AxumState<UpstreamState>,
     method: Method,
     headers: HeaderMap,
+    uri: Uri,
 ) -> AxumResponse {
     let mut recorded_headers = Vec::new();
     for (name, value) in headers.iter() {
@@ -375,10 +534,26 @@ async fn upstream_handler(
             recorded_headers.push((name.as_str().to_string(), value.to_string()));
         }
     }
+    let path = uri.path().to_string();
     state.log.lock().await.push(RecordedRequest {
         method: method.clone(),
         headers: recorded_headers,
     });
+
+    if let Some(target) = state.redirect_target(&path).await {
+        let mut builder = AxumResponse::builder().status(AxumStatusCode::FOUND);
+        builder = builder.header(header::LOCATION, target);
+        return builder
+            .body(AxumBody::empty())
+            .expect("redirect response should build");
+    }
+
+    if path != "/asset" {
+        return AxumResponse::builder()
+            .status(AxumStatusCode::NOT_FOUND)
+            .body(AxumBody::empty())
+            .expect("not found response should build");
+    }
 
     let full = state.body.clone();
     let total_len = full.len() as u64;

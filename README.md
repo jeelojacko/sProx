@@ -156,6 +156,25 @@ playback compatibility. Standard HTTP range semantics apply: a successful partia
 returns `206 Partial Content` with the appropriate `Content-Range`, while full responses
 return `200 OK` alongside the upstream `Content-Length`.
 
+Direct stream destinations must be explicitly allowlisted in configuration. Each entry
+in `direct_stream.allowlist` specifies the domain, permitted schemes, and optional path
+globs that are allowed to be proxied. For example:
+
+```yaml
+direct_stream:
+  allowlist:
+    - domain: "media.example.com"
+      schemes: ["https"]
+      paths:
+        - "/vod/**"
+```
+
+Requests to destinations that do not match the allowlist, use non-HTTP(S) schemes, or
+resolve to private/link-local networks are rejected with `403 Forbidden` before any
+upstream connection is made. Header overrides that fall outside of the built-in request
+allowlist now yield `400 Bad Request`, providing explicit feedback to callers that an
+override is disallowed.
+
 ## Local development
 
 1. **Install prerequisites**
