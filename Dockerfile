@@ -12,9 +12,9 @@ RUN cargo fetch --locked
 
 # Copy the rest of the source tree and build the release binary
 COPY . .
-RUN cargo build --release
+RUN cargo build --locked --release
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime-deps
 
 ARG TARGETARCH
 ARG SHAKA_PACKAGER_VERSION=v2.6.1
@@ -35,13 +35,42 @@ RUN set -eux; \
     ln -s /usr/local/bin/packager /usr/local/bin/shaka-packager; \
     rm -rf /var/lib/apt/lists/*
 
+RUN set -eux; \
+    mkdir -p /runtime-rootfs/usr/local/bin /runtime-rootfs/usr/bin /runtime-rootfs/etc/ssl/certs; \
+    cp /usr/bin/ffmpeg /runtime-rootfs/usr/bin/; \
+    cp /usr/bin/ffprobe /runtime-rootfs/usr/bin/; \
+    cp /usr/local/bin/packager /runtime-rootfs/usr/local/bin/packager; \
+    ln -s packager /runtime-rootfs/usr/local/bin/shaka-packager; \
+    cp /etc/ssl/certs/ca-certificates.crt /runtime-rootfs/etc/ssl/certs/; \
+    libs="$(for bin in /usr/bin/ffmpeg /usr/bin/ffprobe /usr/local/bin/packager; do \
+        ldd "${bin}" | awk '/=>/ { print $3 } /^\\s*\\// { print $1 }'; \
+    done | sort -u)"; \
+    for lib in ${libs}; do \
+        if [ -f "${lib}" ]; then \
+            dest="/runtime-rootfs$(dirname "${lib}")"; \
+            mkdir -p "${dest}"; \
+            cp "${lib}" "${dest}"; \
+        fi; \
+    done
+
+FROM gcr.io/distroless/cc-debian12:latest AS runtime
+
 WORKDIR /app
-COPY --from=builder /app/target/release/sProx /usr/local/bin/sprox
-COPY config ./config
 
 ENV RUST_LOG=info \
-    RUST_BACKTRACE=1
+    RUST_BACKTRACE=1 \
+    SPROX_CONFIG=/config/routes.yaml
+
+COPY --from=runtime-deps /runtime-rootfs/ /
+COPY --from=builder /app/target/release/sProx /usr/local/bin/sprox
+COPY --from=builder --chown=nonroot:nonroot /app/config /config
+
+USER 65532:65532
 
 EXPOSE 8080
-ENTRYPOINT ["sprox"]
-CMD ["--config", "config/routes.yaml"]
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/sprox", "healthcheck", "--url", "http://127.0.0.1:8080/health"]
+
+ENTRYPOINT ["/usr/local/bin/sprox"]
+CMD ["--config", "/config/routes.yaml"]

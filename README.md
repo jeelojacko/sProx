@@ -254,20 +254,34 @@ docker build -t sprox:latest .
 # Run the container, exposing the default listener and mounting local configs
 docker run --rm \
   -p 8080:8080 \
-  -v "$(pwd)/config:/app/config:ro" \
-  sprox:latest --config config/routes.yaml
+  --mount "type=bind,src=$(pwd)/config,dst=/config,readonly" \
+  --mount "type=bind,src=$(pwd)/.env,dst=/app/.env,readonly" \
+  sprox:latest
 ```
+
+The image executes as a non-root user and expects configuration files at
+`/config`. The entrypoint defaults to `--config /config/routes.yaml`, so custom
+locations can be supplied via `SPROX_CONFIG` or CLI arguments. Mount `.env`
+files as read-only bindings to `/app/.env` (as shown above) to load secrets.
 
 The `scripts/docker-run.sh` helper automates the build/run workflow. It produces a
 local `sprox:local` image (override with `IMAGE_NAME`) and starts the container with
-the configuration directory mounted read-only:
+the configuration directory and optional `.env` file mounted read-only:
 
 ```bash
 ./scripts/docker-run.sh
 ```
 
 Pass any additional arguments after the script invocation to forward them to the
-containerized binary (for example `./scripts/docker-run.sh --config config/routes.yaml`).
+containerized binary (for example `./scripts/docker-run.sh --config /config/routes.yaml`).
+
+The container image also exposes a Docker health check that queries the
+`/health` endpoint via the `sprox healthcheck` CLI subcommand. When running
+outside Docker you can invoke the command manually:
+
+```bash
+sprox healthcheck --url http://127.0.0.1:8080/health
+```
 
 ## Repository layout
 
