@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io, net::IpAddr};
+use std::{
+    collections::HashMap,
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+};
 
 use axum::{
     body::Body,
@@ -12,10 +16,15 @@ use axum::{
         StatusCode, Uri,
     },
 };
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
+use hyper::{
+    client::connect::dns::{GaiResolver as HyperGaiResolver, Name},
+    service::Service,
+};
 use ipnet::IpNet;
 use once_cell::sync::Lazy;
 use reqwest::{
+    dns::{Addrs as DnsAddrs, Resolve as DnsResolve, Resolving as DnsResolving},
     header::{
         HeaderMap as ReqwestHeaderMap, HeaderName as ReqwestHeaderName,
         HeaderValue as ReqwestHeaderValue, InvalidHeaderName as ReqwestInvalidHeaderName,
@@ -25,7 +34,6 @@ use reqwest::{
 };
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::net::lookup_host;
 use url::form_urlencoded;
 
 use crate::state::{AppState, DirectStreamSettings};
@@ -112,13 +120,6 @@ enum DirectStreamError {
 
     #[error("destination url `{url}` is missing a host component")]
     MissingHost { url: String },
-
-    #[error("failed to resolve host `{host}`: {source}")]
-    HostResolution {
-        host: String,
-        #[source]
-        source: io::Error,
-    },
 
     #[error("destination `{url}` is not allowlisted")]
     DestinationNotAllowlisted { url: String },
@@ -215,10 +216,6 @@ impl DirectStreamError {
             Self::MissingHost { url } => (
                 StatusCode::BAD_REQUEST,
                 format!("destination url `{url}` must include a host"),
-            ),
-            Self::HostResolution { host, source } => (
-                StatusCode::BAD_REQUEST,
-                format!("failed to resolve `{host}`: {source}"),
             ),
             Self::DestinationNotAllowlisted { url } => (
                 StatusCode::FORBIDDEN,
@@ -528,7 +525,13 @@ impl DirectStreamService {
                 .timeout(self.settings.request_timeout())
                 .send()
                 .await
-                .map_err(|source| DirectStreamError::UpstreamRequest { source })?;
+                .map_err(|error| match extract_restricted_ip(&error) {
+                    Some(ip) => DirectStreamError::DestinationAddressRestricted {
+                        url: current_url.to_string(),
+                        ip,
+                    },
+                    None => DirectStreamError::UpstreamRequest { source: error },
+                })?;
 
             if let Some(next_url) = self.extract_redirect(&current_url, &response)? {
                 redirects += 1;
@@ -564,25 +567,7 @@ impl DirectStreamService {
         }
 
         match url.host() {
-            Some(url::Host::Domain(domain)) => {
-                let port =
-                    url.port_or_known_default()
-                        .ok_or_else(|| DirectStreamError::MissingHost {
-                            url: url.to_string(),
-                        })?;
-
-                let addrs: Vec<_> = lookup_host((domain, port))
-                    .await
-                    .map_err(|source| DirectStreamError::HostResolution {
-                        host: domain.to_string(),
-                        source,
-                    })?
-                    .collect();
-
-                for addr in addrs {
-                    self.ensure_ip_allowed(url, addr.ip())?;
-                }
-            }
+            Some(url::Host::Domain(_)) => {}
             Some(url::Host::Ipv4(addr)) => {
                 self.ensure_ip_allowed(url, IpAddr::V4(addr))?;
             }
@@ -664,5 +649,84 @@ fn is_ip_restricted(ip: &IpAddr) -> bool {
                 || addr.is_unspecified()
         }
         IpAddr::V6(addr) => addr.is_multicast() || addr.is_unspecified(),
+    }
+}
+
+fn extract_restricted_ip(error: &reqwest::Error) -> Option<IpAddr> {
+    let mut current: &(dyn std::error::Error + 'static) = error;
+
+    loop {
+        if let Some(restricted) = current.downcast_ref::<RestrictedIpError>() {
+            return Some(restricted.ip());
+        }
+
+        match current.source() {
+            Some(source) => current = source,
+            None => return None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RestrictedIpError {
+    host: String,
+    ip: IpAddr,
+}
+
+impl RestrictedIpError {
+    fn new(host: String, ip: IpAddr) -> Self {
+        Self { host, ip }
+    }
+
+    fn ip(&self) -> IpAddr {
+        self.ip
+    }
+}
+
+impl fmt::Display for RestrictedIpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "DNS resolution for host `{}` returned restricted address `{}`",
+            self.host, self.ip
+        )
+    }
+}
+
+impl std::error::Error for RestrictedIpError {}
+
+#[derive(Clone)]
+pub(crate) struct RestrictedDnsResolver {
+    inner: HyperGaiResolver,
+}
+
+impl RestrictedDnsResolver {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: HyperGaiResolver::new(),
+        }
+    }
+}
+
+impl DnsResolve for RestrictedDnsResolver {
+    fn resolve(&self, name: Name) -> DnsResolving {
+        let mut resolver = self.inner.clone();
+        let host = name.as_str().to_owned();
+
+        Box::pin(
+            Service::<Name>::call(&mut resolver, name).map(move |result| match result {
+                Ok(addrs) => {
+                    let addrs: Vec<SocketAddr> = addrs.collect();
+
+                    if let Some(restricted) = addrs.iter().find(|addr| is_ip_restricted(&addr.ip()))
+                    {
+                        Err(Box::new(RestrictedIpError::new(host, restricted.ip())) as _)
+                    } else {
+                        Ok(Box::new(addrs.into_iter()) as DnsAddrs)
+                    }
+                }
+                Err(err) => Err(Box::new(err) as _),
+            }),
+        )
     }
 }
