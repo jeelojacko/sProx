@@ -2,7 +2,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -50,14 +50,14 @@ pub(crate) async fn execute_with_retry(
     client: Client,
     request: Request,
     policy: RetryPolicy,
-) -> Result<Response, RetryError> {
+) -> RetryAttempt {
     let shared_policy = Arc::new(SharedPolicy::new(policy));
     shared_policy.budget.deposit();
 
     let retry_policy = ExponentialBackoffPolicy::new(shared_policy.clone());
     let mut retry_service = Retry::new(retry_policy, ReqwestService::new(client));
 
-    match retry_service.call(request).await {
+    let result = match retry_service.call(request).await {
         Ok(response) => Ok(response),
         Err(error) => {
             if shared_policy.circuit_open.load(Ordering::SeqCst) {
@@ -66,6 +66,30 @@ pub(crate) async fn execute_with_retry(
                 Err(RetryError::Request(error))
             }
         }
+    };
+
+    RetryAttempt {
+        attempts: shared_policy.attempts(),
+        result,
+    }
+}
+
+pub(crate) struct RetryAttempt {
+    attempts: u32,
+    result: Result<Response, RetryError>,
+}
+
+impl RetryAttempt {
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    pub fn retries(&self) -> u32 {
+        self.attempts.saturating_sub(1)
+    }
+
+    pub fn into_result(self) -> Result<Response, RetryError> {
+        self.result
     }
 }
 
@@ -108,6 +132,7 @@ impl Policy<Request, Response, reqwest::Error> for ExponentialBackoffPolicy {
                 let delay = self.shared.backoff_delay(self.attempt);
                 let shared = self.shared.clone();
                 let next_attempt = self.attempt + 1;
+                self.shared.record_attempt(next_attempt);
 
                 Some(Box::pin(async move {
                     tokio::time::sleep(delay).await;
@@ -129,6 +154,7 @@ struct SharedPolicy {
     policy: RetryPolicy,
     budget: Arc<Budget>,
     circuit_open: Arc<AtomicBool>,
+    attempts: Arc<AtomicU32>,
 }
 
 impl SharedPolicy {
@@ -138,6 +164,7 @@ impl SharedPolicy {
             policy,
             budget,
             circuit_open: Arc::new(AtomicBool::new(false)),
+            attempts: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -173,6 +200,14 @@ impl SharedPolicy {
         let jitter_range = (1.0 - jitter).max(0.0)..=(1.0 + jitter);
         let factor: f64 = rng.gen_range(jitter_range);
         base.mul_f64(factor)
+    }
+
+    fn attempts(&self) -> u32 {
+        self.attempts.load(Ordering::SeqCst)
+    }
+
+    fn record_attempt(&self, attempt: u32) {
+        self.attempts.store(attempt, Ordering::SeqCst);
     }
 }
 

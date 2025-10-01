@@ -28,6 +28,25 @@ use sProx::config::{
 };
 use sProx::state::{AppState, DirectStreamSettings};
 
+#[cfg(feature = "telemetry")]
+fn ensure_telemetry_initialized() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        sProx::init().expect("telemetry initialization should succeed");
+    });
+}
+
+#[cfg(feature = "telemetry")]
+fn metric_value(metrics: &str, metric: &str, label_fragment: &str) -> Option<f64> {
+    metrics.lines().find_map(|line| {
+        if line.starts_with(metric) && line.contains(label_fragment) {
+            line.split_whitespace().last()?.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Clone)]
 struct RouteProxyUpstreamState {
     log: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -268,6 +287,62 @@ async fn health_endpoint_returns_success() {
         .await
         .expect("server task should join")
         .expect("server should shut down cleanly");
+}
+
+#[cfg(feature = "telemetry")]
+#[tokio::test]
+async fn prometheus_metrics_report_proxy_counters() {
+    ensure_telemetry_initialized();
+
+    let response_headers = vec![
+        ("content-length".to_string(), "13".to_string()),
+        ("etag".to_string(), "test".to_string()),
+    ];
+    let context = spawn_route_proxy_context(HeaderPolicyConfig::default(), response_headers).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("http://{}/asset", context.proxy_addr()))
+        .send()
+        .await
+        .expect("proxy request should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metrics = client
+        .get(format!("http://{}/metrics", context.proxy_addr()))
+        .send()
+        .await
+        .expect("metrics request should succeed")
+        .text()
+        .await
+        .expect("metrics body should decode");
+
+    let requests = metric_value(&metrics, "sprox_requests_total", "route=\"proxy-route\"")
+        .expect("request counter should be present");
+    assert!(requests >= 1.0, "request counter should increment");
+
+    let latency_count = metric_value(
+        &metrics,
+        "sprox_upstream_latency_seconds_count",
+        "route=\"proxy-route\"",
+    )
+    .expect("latency count should be present");
+    assert!(latency_count >= 1.0, "latency count should increment");
+
+    if let Some(bytes) = metric_value(
+        &metrics,
+        "sprox_bytes_streamed_total",
+        "route=\"proxy-route\"",
+    ) {
+        assert!(
+            bytes >= 0.0,
+            "byte counter should be present even for empty bodies"
+        );
+    } else {
+        panic!("byte counter should be present");
+    }
+
+    context.shutdown().await;
 }
 
 #[tokio::test]
@@ -535,6 +610,64 @@ async fn proxy_stream_returns_full_body_and_injects_accept_ranges() {
         .collect::<Vec<_>>();
     assert!(requests.contains(&Method::HEAD));
     assert!(requests.contains(&Method::GET));
+
+    context.shutdown().await;
+}
+
+#[cfg(feature = "telemetry")]
+#[tokio::test]
+async fn prometheus_metrics_report_direct_stream_counters() {
+    ensure_telemetry_initialized();
+
+    let body = b"stream-metrics".to_vec();
+    let context = spawn_stream_test(body.clone()).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("direct stream request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let metrics = client
+        .get(format!("http://{}/metrics", context.app_addr()))
+        .send()
+        .await
+        .expect("metrics request should succeed")
+        .text()
+        .await
+        .expect("metrics body should decode");
+
+    let requests = metric_value(&metrics, "sprox_requests_total", "route=\"direct_stream\"")
+        .expect("request counter should be present");
+    assert!(requests >= 1.0, "request counter should increment");
+
+    let latency_count = metric_value(
+        &metrics,
+        "sprox_upstream_latency_seconds_count",
+        "route=\"direct_stream\"",
+    )
+    .expect("latency count should be present");
+    assert!(latency_count >= 1.0, "latency count should increment");
+
+    let bytes = metric_value(
+        &metrics,
+        "sprox_bytes_streamed_total",
+        "route=\"direct_stream\"",
+    )
+    .expect("byte counter should be present");
+    assert!(
+        bytes >= body.len() as f64,
+        "byte counter should track streamed size"
+    );
 
     context.shutdown().await;
 }

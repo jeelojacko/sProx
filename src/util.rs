@@ -1,5 +1,9 @@
 use std::fmt;
 
+use http::HeaderMap;
+use rand::random;
+use uuid::Uuid;
+
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 
@@ -28,6 +32,21 @@ pub fn decode_base64_url(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 pub fn decode_base64_to_string(data: &str) -> Result<String, Base64TextError> {
     let bytes = decode_base64(data).map_err(Base64TextError::InvalidEncoding)?;
     String::from_utf8(bytes).map_err(|err| Base64TextError::InvalidUtf8(err.utf8_error()))
+}
+
+/// Derives a request identifier from the provided headers.
+///
+/// The function prefers a caller-supplied `x-request-id` header when present,
+/// falling back to a freshly generated UUID v4 when the header is missing or
+/// empty.
+pub fn extract_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::from_u128(random()).to_string())
 }
 
 /// Error returned when a Base64 string cannot be converted into UTF-8 text.

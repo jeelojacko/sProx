@@ -26,6 +26,7 @@ use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget};
 use crate::stream::hls;
+use crate::util;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -136,6 +137,7 @@ pub enum ProxyError {
     name = "proxy.forward",
     skip(state, request),
     fields(
+        request.id = tracing::field::Empty,
         route.id = tracing::field::Empty,
         route.host = tracing::field::Empty,
         upstream.url = tracing::field::Empty,
@@ -146,8 +148,10 @@ pub async fn forward(
     state: AppState,
     request: Request<Body>,
 ) -> Result<Response<Body>, ProxyError> {
+    let request_id = util::extract_request_id(request.headers());
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
     let span = tracing::Span::current();
+    span.record("request.id", &tracing::field::display(&request_id));
     span.record("route.host", &tracing::field::display(&host));
 
     let protocol = determine_route_protocol(&request);
@@ -209,28 +213,35 @@ pub async fn forward(
 
     let request_start = Instant::now();
     let retry_policy = route.retry.clone();
-    let upstream_response =
-        match retry::execute_with_retry(client.clone(), request, retry_policy).await {
-            Ok(response) => response,
-            Err(RetryError::BudgetExhausted { source }) => {
-                let latency_ms = request_start.elapsed().as_millis() as u64;
-                error!(
-                    latency_ms,
-                    error = %source,
-                    "retry budget exhausted while forwarding request"
-                );
-                return Err(ProxyError::CircuitOpen { source });
-            }
-            Err(RetryError::Request(source)) => {
-                let latency_ms = request_start.elapsed().as_millis() as u64;
-                error!(
-                    latency_ms,
-                    error = %source,
-                    "failed to forward request to upstream"
-                );
-                return Err(ProxyError::UpstreamRequest { source });
-            }
-        };
+    let retry_outcome = retry::execute_with_retry(client.clone(), request, retry_policy).await;
+    let retries = retry_outcome.retries();
+    let upstream_response = match retry_outcome.into_result() {
+        Ok(response) => response,
+        Err(RetryError::BudgetExhausted { source }) => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                retry.count = retries,
+                error = %source,
+                "retry budget exhausted while forwarding request"
+            );
+            return Err(ProxyError::CircuitOpen { source });
+        }
+        Err(RetryError::Request(source)) => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                retry.count = retries,
+                error = %source,
+                "failed to forward request to upstream"
+            );
+            return Err(ProxyError::UpstreamRequest { source });
+        }
+    };
 
     let latency = request_start.elapsed();
     let latency_ms = latency.as_millis() as u64;
@@ -251,7 +262,7 @@ pub async fn forward(
         }
     };
 
-    info!(status = %status, latency_ms, "forwarded upstream response");
+    let mut response_bytes = upstream_response.content_length();
 
     let upstream_headers = upstream_response.headers().clone();
     let mut header_entries = Vec::with_capacity(upstream_headers.len());
@@ -311,6 +322,7 @@ pub async fn forward(
         .map_err(|source| ProxyError::HlsProcessing { source })?;
 
         header_entries.retain(|(name, _)| name != CONTENT_LENGTH);
+        response_bytes = Some(rewritten.len() as u64);
 
         Body::from(rewritten)
     } else {
@@ -328,9 +340,38 @@ pub async fn forward(
         }
     }
 
-    response_builder
+    let response = response_builder
         .body(response_body)
-        .map_err(|source| ProxyError::ResponseBuild { source })
+        .map_err(|source| ProxyError::ResponseBuild { source })?;
+
+    let response_bytes = response_bytes.unwrap_or_default();
+
+    info!(
+        request.id = %request_id,
+        route.id = %route_id,
+        status = %status,
+        latency_ms,
+        retry.count = retries,
+        response.bytes = response_bytes,
+        "forwarded upstream response"
+    );
+
+    #[cfg(feature = "telemetry")]
+    {
+        metrics::counter!("sprox_requests_total", "route" => route_id.clone()).increment(1);
+        metrics::histogram!(
+            "sprox_upstream_latency_seconds",
+            "route" => route_id.clone(),
+        )
+        .record(latency.as_secs_f64());
+        metrics::counter!(
+            "sprox_bytes_streamed_total",
+            "route" => route_id.clone(),
+        )
+        .increment(response_bytes);
+    }
+
+    Ok(response)
 }
 
 fn extract_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
