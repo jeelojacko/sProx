@@ -649,6 +649,9 @@ fn parse_direct_stream_allowlist(
     Ok(DirectStreamAllowlist { rules: parsed })
 }
 
+const MIN_RETRY_BUDGET_TTL_MS: u64 = 1_000;
+const MAX_RETRY_BUDGET_TTL_MS: u64 = 60_000;
+
 fn parse_retry(raw: Option<RawRetry>, context: String) -> Result<RetryConfig, ConfigError> {
     let mut retry = RetryConfig::default();
 
@@ -701,6 +704,15 @@ fn parse_retry(raw: Option<RawRetry>, context: String) -> Result<RetryConfig, Co
 
     if let Some(budget) = raw.budget {
         if let Some(ttl_ms) = budget.ttl_ms {
+            if !(MIN_RETRY_BUDGET_TTL_MS..=MAX_RETRY_BUDGET_TTL_MS).contains(&ttl_ms) {
+                return Err(validation_error(
+                    format!("{context}.budget.ttl_ms"),
+                    format!(
+                        "ttl_ms must be between {MIN_RETRY_BUDGET_TTL_MS} and {MAX_RETRY_BUDGET_TTL_MS} milliseconds (1-60 seconds)"
+                    ),
+                ));
+            }
+
             retry.budget.ttl = duration_from_millis(ttl_ms, format!("{context}.budget.ttl_ms"))?;
         }
 
@@ -1147,6 +1159,58 @@ mod tests {
         assert_eq!(direct.retry.budget.ttl, Duration::from_millis(5_000));
         assert_eq!(direct.retry.budget.min_per_sec, 1);
         assert!((direct.retry.budget.retry_ratio - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn direct_stream_rejects_retry_budget_ttl_below_supported_range() {
+        let raw = RawConfig {
+            direct_stream: Some(RawDirectStream {
+                retry: Some(RawRetry {
+                    budget: Some(RawRetryBudget {
+                        ttl_ms: Some(MIN_RETRY_BUDGET_TTL_MS - 1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            routes: vec![sample_route()],
+        };
+
+        let err = Config::try_from(raw).expect_err("validation should fail");
+        match err {
+            ConfigError::Validation { context, message } => {
+                assert_eq!(context, "direct_stream.retry.budget.ttl_ms");
+                assert!(message.contains("between"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn direct_stream_rejects_retry_budget_ttl_above_supported_range() {
+        let raw = RawConfig {
+            direct_stream: Some(RawDirectStream {
+                retry: Some(RawRetry {
+                    budget: Some(RawRetryBudget {
+                        ttl_ms: Some(MAX_RETRY_BUDGET_TTL_MS + 1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            routes: vec![sample_route()],
+        };
+
+        let err = Config::try_from(raw).expect_err("validation should fail");
+        match err {
+            ConfigError::Validation { context, message } => {
+                assert_eq!(context, "direct_stream.retry.budget.ttl_ms");
+                assert!(message.contains("between"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
