@@ -15,6 +15,7 @@ default = [
 http-proxy = [
     "dep:axum",
     "dep:tower",
+    "dep:tower-http",
     "dep:hyper",
     "dep:reqwest",
     "dep:serde",
@@ -68,7 +69,8 @@ serde_yaml = { version = "0.9", optional = true }
 thiserror = "1.0"
 tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "signal", "process"] }
 tower = { version = "0.4", features = ["util", "limit", "retry"], optional = true }
-tower-http = { version = "0.5", features = ["trace"], optional = true }
+tower-http = { version = "0.5", features = ["trace", "cors"], optional = true }
+axum-server = { version = "0.6", features = ["tls-rustls"] }
 tracing = { version = "0.1", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"], optional = true }
 metrics = { version = "0.22", optional = true }

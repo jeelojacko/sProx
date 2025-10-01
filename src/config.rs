@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use config as config_rs;
 use globset::Glob;
-use http::header::HeaderName;
+use http::{header::HeaderName, HeaderValue, Method};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
@@ -18,6 +18,7 @@ pub struct Config {
     pub routes: Vec<RouteConfig>,
     pub secrets: SecretsConfig,
     pub sensitive_logging: SensitiveLoggingConfig,
+    pub cors: Option<CorsConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,13 @@ impl Default for SecretsConfig {
 pub struct SensitiveLoggingConfig {
     pub log_sensitive_headers: bool,
     pub redact_sensitive_queries: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    pub allow_origins: Vec<HeaderValue>,
+    pub allow_methods: Vec<Method>,
+    pub allow_headers: Vec<HeaderName>,
 }
 
 impl DirectStreamConfig {
@@ -131,6 +139,22 @@ pub struct RouteConfig {
 pub struct ListenerConfig {
     pub host: String,
     pub port: u16,
+    pub tls: Option<ListenerTlsConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerTlsConfig {
+    pub certificate_path: PathBuf,
+    pub private_key_path: PathBuf,
+    pub watch_for_changes: bool,
+    pub acme: Option<ListenerTlsAcmeConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListenerTlsAcmeConfig {
+    pub cache_path: PathBuf,
+    pub contact_emails: Vec<String>,
+    pub directory_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +327,8 @@ struct RawConfig {
     secrets: Option<RawSecrets>,
     #[serde(default)]
     sensitive_logging: Option<RawSensitiveLogging>,
+    #[serde(default)]
+    cors: Option<RawCors>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -339,6 +365,16 @@ struct RawSensitiveLogging {
     redact_sensitive_queries: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct RawCors {
+    #[serde(default)]
+    allow_origins: Vec<String>,
+    #[serde(default)]
+    allow_methods: Vec<String>,
+    #[serde(default)]
+    allow_headers: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct RawDirectStreamAllowRule {
     domain: String,
@@ -365,6 +401,34 @@ struct RawRoute {
 struct RawListener {
     host: String,
     port: u16,
+    #[serde(default)]
+    tls: Option<RawListenerTls>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawListenerTls {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    certificate_path: Option<String>,
+    #[serde(default)]
+    private_key_path: Option<String>,
+    #[serde(default = "default_true")]
+    watch_for_changes: bool,
+    #[serde(default)]
+    acme: Option<RawListenerTlsAcme>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawListenerTlsAcme {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    contact_emails: Vec<String>,
+    #[serde(default)]
+    directory_url: Option<String>,
+    #[serde(default)]
+    cache_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -484,12 +548,14 @@ impl TryFrom<RawConfig> for Config {
         let direct_stream = parse_direct_stream(raw.direct_stream)?;
         let secrets = parse_secrets(raw.secrets)?;
         let sensitive_logging = parse_sensitive_logging(raw.sensitive_logging)?;
+        let cors = parse_cors(raw.cors, "cors")?;
 
         Ok(Self {
             direct_stream,
             routes,
             secrets,
             sensitive_logging,
+            cors,
         })
     }
 }
@@ -572,6 +638,85 @@ fn parse_direct_stream(
     }
 
     Ok(parsed)
+}
+
+fn parse_cors(raw: Option<RawCors>, context: &str) -> Result<Option<CorsConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let mut allow_origins = Vec::with_capacity(raw.allow_origins.len());
+    for (idx, origin) in raw.allow_origins.into_iter().enumerate() {
+        let trimmed = origin.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.allow_origins[{idx}]"),
+                "origin must not be empty",
+            ));
+        }
+
+        let value = HeaderValue::from_str(trimmed).map_err(|err| {
+            validation_error(
+                format!("{context}.allow_origins[{idx}]"),
+                format!("invalid origin `{origin}`: {err}"),
+            )
+        })?;
+
+        if !allow_origins.contains(&value) {
+            allow_origins.push(value);
+        }
+    }
+
+    let mut allow_methods = Vec::with_capacity(raw.allow_methods.len());
+    for (idx, method) in raw.allow_methods.into_iter().enumerate() {
+        let trimmed = method.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.allow_methods[{idx}]"),
+                "method must not be empty",
+            ));
+        }
+
+        let normalized = trimmed.to_ascii_uppercase();
+        let parsed = normalized.parse::<Method>().map_err(|_| {
+            validation_error(
+                format!("{context}.allow_methods[{idx}]"),
+                format!("invalid HTTP method `{method}`"),
+            )
+        })?;
+
+        if !allow_methods.contains(&parsed) {
+            allow_methods.push(parsed);
+        }
+    }
+
+    let mut allow_headers = Vec::with_capacity(raw.allow_headers.len());
+    for (idx, header) in raw.allow_headers.into_iter().enumerate() {
+        let trimmed = header.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.allow_headers[{idx}]"),
+                "header must not be empty",
+            ));
+        }
+
+        let parsed = HeaderName::from_bytes(trimmed.as_bytes()).map_err(|err| {
+            validation_error(
+                format!("{context}.allow_headers[{idx}]"),
+                format!("invalid header `{header}`: {err}"),
+            )
+        })?;
+
+        if !allow_headers.contains(&parsed) {
+            allow_headers.push(parsed);
+        }
+    }
+
+    Ok(Some(CorsConfig {
+        allow_origins,
+        allow_methods,
+        allow_headers,
+    }))
 }
 
 fn parse_secrets(raw: Option<RawSecrets>) -> Result<SecretsConfig, ConfigError> {
@@ -776,6 +921,10 @@ fn parse_direct_stream_allowlist(
 const MIN_RETRY_BUDGET_TTL_MS: u64 = 1_000;
 const MAX_RETRY_BUDGET_TTL_MS: u64 = 60_000;
 
+const fn default_true() -> bool {
+    true
+}
+
 fn parse_retry(raw: Option<RawRetry>, context: String) -> Result<RetryConfig, ConfigError> {
     let mut retry = RetryConfig::default();
 
@@ -866,17 +1015,117 @@ fn parse_listener(raw: RawListener, context: &str) -> Result<ListenerConfig, Con
         ));
     }
 
-    if raw.port == 0 {
-        return Err(validation_error(
-            format!("{context}.listen.port"),
-            "port must be greater than zero",
-        ));
-    }
+    let tls_context = format!("{context}.listen.tls");
+    let tls = parse_listener_tls(raw.tls, &tls_context)?;
 
     Ok(ListenerConfig {
         host: raw.host,
         port: raw.port,
+        tls,
     })
+}
+
+fn parse_listener_tls(
+    raw: Option<RawListenerTls>,
+    context: &str,
+) -> Result<Option<ListenerTlsConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    let certificate_path = raw
+        .certificate_path
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            validation_error(
+                format!("{context}.certificate_path"),
+                "certificate_path must be set when TLS is enabled",
+            )
+        })?;
+
+    let private_key_path = raw
+        .private_key_path
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            validation_error(
+                format!("{context}.private_key_path"),
+                "private_key_path must be set when TLS is enabled",
+            )
+        })?;
+
+    let acme_context = format!("{context}.acme");
+    let acme = parse_listener_tls_acme(raw.acme, &acme_context)?;
+
+    Ok(Some(ListenerTlsConfig {
+        certificate_path: PathBuf::from(certificate_path),
+        private_key_path: PathBuf::from(private_key_path),
+        watch_for_changes: raw.watch_for_changes,
+        acme,
+    }))
+}
+
+fn parse_listener_tls_acme(
+    raw: Option<RawListenerTlsAcme>,
+    context: &str,
+) -> Result<Option<ListenerTlsAcmeConfig>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    if !raw.enabled {
+        return Ok(None);
+    }
+
+    let cache_path = raw
+        .cache_path
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            validation_error(
+                format!("{context}.cache_path"),
+                "cache_path must be set when ACME automation is enabled",
+            )
+        })?;
+
+    let mut contact_emails = Vec::with_capacity(raw.contact_emails.len());
+    for (idx, email) in raw.contact_emails.into_iter().enumerate() {
+        let trimmed = email.trim();
+        if trimmed.is_empty() {
+            return Err(validation_error(
+                format!("{context}.contact_emails[{idx}]"),
+                "contact email must not be empty",
+            ));
+        }
+
+        let normalized = trimmed.to_ascii_lowercase();
+        if !contact_emails.contains(&normalized) {
+            contact_emails.push(normalized);
+        }
+    }
+
+    if contact_emails.is_empty() {
+        return Err(validation_error(
+            format!("{context}.contact_emails"),
+            "at least one contact email must be provided when ACME automation is enabled",
+        ));
+    }
+
+    let directory_url = raw
+        .directory_url
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+
+    Ok(Some(ListenerTlsAcmeConfig {
+        cache_path: PathBuf::from(cache_path),
+        contact_emails,
+        directory_url,
+    }))
 }
 
 fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, ConfigError> {
@@ -1191,6 +1440,7 @@ mod tests {
             listen: RawListener {
                 host: "127.0.0.1".into(),
                 port: 8080,
+                tls: None,
             },
             host_patterns: Vec::new(),
             protocols: Vec::new(),
@@ -1269,6 +1519,7 @@ mod tests {
                 listen: RawListener {
                     host: "127.0.0.1".into(),
                     port: 8080,
+                    tls: None,
                 },
                 host_patterns: Vec::new(),
                 protocols: Vec::new(),
@@ -1286,6 +1537,7 @@ mod tests {
             }],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1311,6 +1563,7 @@ mod tests {
             routes: vec![sample_route()],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1346,6 +1599,7 @@ mod tests {
             routes: vec![sample_route()],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1390,6 +1644,7 @@ mod tests {
             routes: vec![sample_route()],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1418,6 +1673,7 @@ mod tests {
             routes: vec![sample_route()],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1449,6 +1705,7 @@ mod tests {
             routes: vec![sample_route()],
             secrets: None,
             sensitive_logging: None,
+            cors: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1475,6 +1732,7 @@ mod tests {
                 default_ttl_secs: Some(120),
             }),
             sensitive_logging: None,
+            cors: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");
@@ -1490,6 +1748,7 @@ mod tests {
                 default_ttl_secs: Some(0),
             }),
             sensitive_logging: None,
+            cors: None,
         };
 
         let err = Config::try_from(raw).expect_err("validation should fail");
@@ -1511,6 +1770,7 @@ mod tests {
                 log_sensitive_headers: Some(true),
                 redact_sensitive_queries: Some(true),
             }),
+            cors: None,
         };
 
         let config = Config::try_from(raw).expect("configuration should load");

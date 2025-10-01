@@ -3,18 +3,20 @@ use std::{
     io::ErrorKind,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
+use axum_server::tls_rustls::RustlsConfig;
+use axum_server::{self, Handle};
 use sProx::{
     app,
-    config::{Config, ListenerConfig},
+    config::{Config, ListenerConfig, ListenerTlsAcmeConfig, ListenerTlsConfig},
     state::{reload_app_state_from_path, AppState, SharedAppState},
 };
-use tokio::net::TcpListener;
+use tokio::{fs, net::TcpListener, sync::watch, time::sleep};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -90,21 +92,20 @@ async fn run_server() -> Result<()> {
         .context("configuration must define at least one route to determine listener address")?;
     let addr = resolve_listener_addr(listener)
         .context("failed to resolve listener address from configuration")?;
+    let tls_settings = listener.tls.clone();
 
     let app_state = AppState::from_config(&config)
         .context("failed to build application state from configuration")?;
     let shared_state = SharedAppState::new(app_state);
     let router = app::build_router(shared_state.clone());
+    let mut make_service = Some(router.into_make_service_with_connect_info::<SocketAddr>());
 
-    tracing::info!(path = %config_path.display(), %addr, "starting sProx server");
-
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| "failed to bind listener socket")?;
-    let local_addr = listener
-        .local_addr()
-        .with_context(|| "failed to determine listener address")?;
-    tracing::info!(%local_addr, "sProx listening");
+    tracing::info!(
+        path = %config_path.display(),
+        %addr,
+        tls = tls_settings.is_some(),
+        "starting sProx server"
+    );
 
     #[cfg(unix)]
     tokio::spawn(watch_for_config_reloads(
@@ -112,10 +113,63 @@ async fn run_server() -> Result<()> {
         shared_state.clone(),
     ));
 
-    axum::serve(listener, router)
+    if let Some(tls) = tls_settings {
+        if let Some(acme) = tls.acme.as_ref() {
+            prepare_acme_environment(acme).await?;
+        }
+
+        let rustls_config = build_rustls_config(&tls).await?;
+        let handle = Handle::new();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        if tls.watch_for_changes {
+            spawn_tls_reload_task(tls.clone(), rustls_config.clone(), shutdown_rx.clone());
+        }
+
+        let shutdown_handle = handle.clone();
+        let shutdown_task = tokio::spawn(async move {
+            shutdown_signal().await;
+            shutdown_handle.graceful_shutdown(None);
+        });
+
+        let log_handle = handle.clone();
+        tokio::spawn(async move {
+            if let Some(addr) = log_handle.listening().await {
+                tracing::info!(%addr, "sProx listening");
+            }
+        });
+
+        axum_server::bind_rustls(addr, rustls_config)
+            .handle(handle)
+            .serve(
+                make_service
+                    .take()
+                    .expect("make service should be available for TLS"),
+            )
+            .await
+            .context("server error")?;
+
+        let _ = shutdown_tx.send(true);
+        shutdown_task.abort();
+    } else {
+        let listener = TcpListener::bind(addr)
+            .await
+            .with_context(|| "failed to bind listener socket")?;
+        let local_addr = listener
+            .local_addr()
+            .with_context(|| "failed to determine listener address")?;
+        tracing::info!(%local_addr, "sProx listening");
+
+        axum::serve(
+            listener,
+            make_service
+                .take()
+                .expect("make service should be available for HTTP"),
+        )
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+    }
 
     tracing::info!("sProx shutdown complete");
 
@@ -213,6 +267,142 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("shutdown signal received");
+}
+
+async fn build_rustls_config(config: &ListenerTlsConfig) -> Result<RustlsConfig> {
+    RustlsConfig::from_pem_file(&config.certificate_path, &config.private_key_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load TLS materials from `{}` and `{}`",
+                config.certificate_path.display(),
+                config.private_key_path.display()
+            )
+        })
+}
+
+fn spawn_tls_reload_task(
+    tls: ListenerTlsConfig,
+    rustls_config: RustlsConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = watch_certificate_changes(tls, rustls_config, &mut shutdown).await {
+            tracing::error!(error = ?error, "TLS certificate watcher terminated unexpectedly");
+        }
+    });
+}
+
+async fn watch_certificate_changes(
+    tls: ListenerTlsConfig,
+    rustls_config: RustlsConfig,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut last_seen = read_certificate_timestamps(&tls).await?;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            _ = sleep(Duration::from_secs(5)) => {
+                match read_certificate_timestamps(&tls).await {
+                    Ok(timestamps) => {
+                        if timestamps != last_seen {
+                            match rustls_config
+                                .reload_from_pem_file(&tls.certificate_path, &tls.private_key_path)
+                                .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        certificate = %tls.certificate_path.display(),
+                                        key = %tls.private_key_path.display(),
+                                        "TLS certificates reloaded"
+                                    );
+                                    last_seen = timestamps;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        certificate = %tls.certificate_path.display(),
+                                        key = %tls.private_key_path.display(),
+                                        "failed to reload TLS certificates"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = ?error,
+                            certificate = %tls.certificate_path.display(),
+                            key = %tls.private_key_path.display(),
+                            "failed to inspect TLS certificate metadata"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn read_certificate_timestamps(
+    config: &ListenerTlsConfig,
+) -> Result<(SystemTime, SystemTime)> {
+    let cert_meta = fs::metadata(&config.certificate_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read certificate metadata at `{}`",
+                config.certificate_path.display()
+            )
+        })?;
+    let key_meta = fs::metadata(&config.private_key_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to read private key metadata at `{}`",
+                config.private_key_path.display()
+            )
+        })?;
+
+    let cert_modified = cert_meta.modified().with_context(|| {
+        format!(
+            "failed to determine modification time for `{}`",
+            config.certificate_path.display()
+        )
+    })?;
+    let key_modified = key_meta.modified().with_context(|| {
+        format!(
+            "failed to determine modification time for `{}`",
+            config.private_key_path.display()
+        )
+    })?;
+
+    Ok((cert_modified, key_modified))
+}
+
+async fn prepare_acme_environment(config: &ListenerTlsAcmeConfig) -> Result<()> {
+    fs::create_dir_all(&config.cache_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create ACME cache directory `{}`",
+                config.cache_path.display()
+            )
+        })?;
+
+    tracing::info!(
+        cache = %config.cache_path.display(),
+        contacts = ?config.contact_emails,
+        directory = %config
+            .directory_url
+            .as_deref()
+            .unwrap_or("https://acme-v02.api.letsencrypt.org/directory"),
+        "ACME automation hooks enabled"
+    );
+
+    Ok(())
 }
 
 fn load_env_file() -> anyhow::Result<()> {

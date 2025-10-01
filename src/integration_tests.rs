@@ -140,6 +140,7 @@ async fn spawn_route_proxy_context(
             listen: ListenerConfig {
                 host: "127.0.0.1".into(),
                 port: proxy_addr.port(),
+                tls: None,
             },
             host_patterns: vec!["127.0.0.1".into()],
             protocols: Vec::new(),
@@ -167,6 +168,7 @@ async fn spawn_route_proxy_context(
         }],
         secrets: SecretsConfig::default(),
         sensitive_logging: SensitiveLoggingConfig::default(),
+        cors: None,
     };
 
     let state = AppState::from_config(&config).expect("app state should build");
@@ -225,6 +227,7 @@ async fn health_endpoint_returns_success() {
             listen: ListenerConfig {
                 host: "127.0.0.1".into(),
                 port: 0,
+                tls: None,
             },
             host_patterns: Vec::new(),
             protocols: Vec::new(),
@@ -251,6 +254,7 @@ async fn health_endpoint_returns_success() {
         }],
         secrets: SecretsConfig::default(),
         sensitive_logging: SensitiveLoggingConfig::default(),
+        cors: None,
     };
 
     let state = AppState::from_config(&config).expect("app state should build");
@@ -357,6 +361,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
             listen: ListenerConfig {
                 host: "127.0.0.1".into(),
                 port: 0,
+                tls: None,
             },
             host_patterns: Vec::new(),
             protocols: Vec::new(),
@@ -390,6 +395,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
         ],
         secrets: SecretsConfig::default(),
         sensitive_logging: SensitiveLoggingConfig::default(),
+        cors: None,
     };
 
     let state = AppState::from_config(&config).expect("app state should build");
