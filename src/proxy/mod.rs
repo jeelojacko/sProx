@@ -1,3 +1,5 @@
+pub mod classify;
+
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
