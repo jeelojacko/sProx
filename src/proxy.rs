@@ -140,6 +140,7 @@ pub enum ProxyError {
         request.id = tracing::field::Empty,
         route.id = tracing::field::Empty,
         route.host = tracing::field::Empty,
+        route.socks5_override = tracing::field::Empty,
         upstream.url = tracing::field::Empty,
         client.scheme = tracing::field::Empty
     )
@@ -166,6 +167,10 @@ pub async fn forward(
 
     let (route_id, route) = lookup_route(state, &host, &route_request).await?;
     span.record("route.id", &tracing::field::display(&route_id));
+    span.record(
+        "route.socks5_override",
+        &tracing::field::display(route.socks5_overridden),
+    );
     let upstream_url = build_upstream_url(&route, request.uri())?;
     span.record("upstream.url", &tracing::field::display(&upstream_url));
     let manifest_url = upstream_url.clone();
@@ -1027,6 +1032,7 @@ mod tests {
             request_timeout: None,
             tls_insecure_skip_verify: false,
             socks5: None,
+            socks5_overridden: false,
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
@@ -1154,6 +1160,7 @@ mod tests {
             request_timeout: None,
             tls_insecure_skip_verify: false,
             socks5: None,
+            socks5_overridden: false,
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
@@ -1280,6 +1287,7 @@ mod tests {
             request_timeout: Some(Duration::from_millis(100)),
             tls_insecure_skip_verify: false,
             socks5: None,
+            socks5_overridden: false,
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
@@ -1325,6 +1333,7 @@ mod tests {
             request_timeout: None,
             tls_insecure_skip_verify: false,
             socks5: None,
+            socks5_overridden: false,
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
@@ -1369,6 +1378,7 @@ mod tests {
             request_timeout: Some(Duration::from_secs(1)),
             tls_insecure_skip_verify: false,
             socks5: None,
+            socks5_overridden: false,
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
@@ -1584,6 +1594,7 @@ mod tests {
                 request_timeout: Some(Duration::from_secs(1)),
                 tls_insecure_skip_verify: false,
                 socks5: None,
+                socks5_overridden: false,
                 hls: Some(hls_options),
                 retry: RetryPolicy::default(),
                 header_policy: crate::state::HeaderPolicy::default(),
