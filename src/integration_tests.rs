@@ -349,12 +349,7 @@ async fn prometheus_metrics_report_proxy_counters() {
     context.shutdown().await;
 }
 
-#[tokio::test]
-async fn socks5_proxy_env_override_applies_to_all_routes() {
-    env::remove_var("SPROX_PROXY_URL");
-    let proxy_address = "127.0.0.1:1081";
-    env::set_var("SPROX_PROXY_URL", proxy_address);
-
+fn socks5_override_test_config() -> Config {
     let route_template =
         |id: &str, socks5_enabled: bool, socks5_address: Option<&str>| RouteConfig {
             id: id.into(),
@@ -387,7 +382,7 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
             hls: None,
         };
 
-    let config = Config {
+    Config {
         direct_stream: None,
         routes: vec![
             route_template("disabled-proxy", false, None),
@@ -396,8 +391,16 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
         secrets: SecretsConfig::default(),
         sensitive_logging: SensitiveLoggingConfig::default(),
         cors: None,
-    };
+    }
+}
 
+#[tokio::test]
+async fn socks5_proxy_env_override_applies_to_all_routes() {
+    env::remove_var("SPROX_PROXY_URL");
+    let proxy_address = "127.0.0.1:1081";
+    env::set_var("SPROX_PROXY_URL", proxy_address);
+
+    let config = socks5_override_test_config();
     let state = AppState::from_config(&config).expect("app state should build");
     let routing_table = state.routing_table();
     let table = routing_table.read().await;
@@ -410,9 +413,118 @@ async fn socks5_proxy_env_override_applies_to_all_routes() {
         assert_eq!(socks5.address, proxy_address);
         assert_eq!(socks5.username.as_deref(), Some("user"));
         assert_eq!(socks5.password.as_deref(), Some("secret"));
+        assert!(
+            target.socks5_overridden,
+            "override marker should be set when proxy env var is provided"
+        );
     }
 
     env::remove_var("SPROX_PROXY_URL");
+}
+
+#[test]
+fn socks5_proxy_override_emits_startup_log() {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct BufferWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferGuard;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            BufferGuard {
+                buffer: Arc::clone(&self.buffer),
+            }
+        }
+    }
+
+    struct BufferGuard {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for BufferGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut output = self.buffer.lock().expect("buffer lock should not poison");
+            output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    env::remove_var("SPROX_PROXY_URL");
+    let proxy_address = "127.0.0.1:1081";
+    env::set_var("SPROX_PROXY_URL", proxy_address);
+
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let writer = BufferWriter {
+        buffer: Arc::clone(&buffer),
+    };
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .json()
+        .with_writer(writer)
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let config = socks5_override_test_config();
+        AppState::from_config(&config).expect("app state should build");
+    });
+
+    env::remove_var("SPROX_PROXY_URL");
+
+    let contents = {
+        let buffer = buffer.lock().expect("buffer lock should not poison");
+        String::from_utf8(buffer.clone()).expect("log buffer should be valid UTF-8")
+    };
+
+    assert!(
+        !contents.is_empty(),
+        "expected log output when proxy override is set"
+    );
+
+    let line = contents
+        .lines()
+        .find(|line| line.contains("proxy override"))
+        .expect("override log should be present");
+    let event: serde_json::Value =
+        serde_json::from_str(line).expect("log line should be valid JSON");
+    let fields = event
+        .get("fields")
+        .expect("json log should contain fields object");
+
+    assert_eq!(
+        fields.get("message").and_then(|value| value.as_str()),
+        Some("applying SOCKS5 proxy override from environment")
+    );
+    assert_eq!(
+        fields
+            .get("override_target")
+            .and_then(|value| value.as_str()),
+        Some(proxy_address)
+    );
+    assert_eq!(
+        fields.get("routes").and_then(|value| value.as_u64()),
+        Some(2)
+    );
+
+    let route_ids = fields
+        .get("route_ids")
+        .and_then(|value| value.as_str())
+        .expect("route ids should be present");
+    let mut routes: Vec<_> = route_ids.split(',').collect();
+    routes.sort();
+    assert_eq!(routes, vec!["disabled-proxy", "enabled-proxy"]);
 }
 
 #[tokio::test]

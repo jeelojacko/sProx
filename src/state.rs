@@ -67,6 +67,9 @@ pub struct RouteTarget {
     pub tls_insecure_skip_verify: bool,
     /// Optional SOCKS5 proxy settings applied to outbound requests.
     pub socks5: Option<Socks5Proxy>,
+    /// Indicates whether the SOCKS5 settings were provided via the global
+    /// environment override rather than the route configuration.
+    pub socks5_overridden: bool,
     /// Optional HLS processing configuration applied to responses.
     pub hls: Option<HlsOptions>,
     /// Retry policy used for outbound requests targeting this upstream.
@@ -921,9 +924,12 @@ impl AppState {
             .ok()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        let mut override_applied_routes = Vec::new();
 
         for route in &config.routes {
+            let mut socks5_overridden = false;
             let socks5 = if let Some(override_address) = socks5_override.as_ref() {
+                socks5_overridden = true;
                 Some(Socks5Proxy {
                     address: override_address.clone(),
                     username: route.upstream.socks5.username.clone(),
@@ -958,12 +964,17 @@ impl AppState {
                 request_timeout: route.upstream.request_timeout,
                 tls_insecure_skip_verify: route.upstream.tls.insecure_skip_verify,
                 socks5,
+                socks5_overridden,
                 hls,
                 retry: route.upstream.retry.clone().into(),
                 header_policy: route.upstream.header_policy.clone().into(),
             };
 
             routing_table.insert(route.id.clone(), target);
+
+            if socks5_overridden {
+                override_applied_routes.push(route.id.clone());
+            }
 
             let port_range = PortRange::new(route.listen.port, route.listen.port)?;
             route_definitions.push(RouteDefinition {
@@ -975,6 +986,15 @@ impl AppState {
         }
 
         let routing_engine = Arc::new(RoutingEngine::new(route_definitions)?);
+
+        if let Some(override_address) = socks5_override.as_ref() {
+            tracing::info!(
+                override_target = %override_address,
+                routes = override_applied_routes.len(),
+                route_ids = %override_applied_routes.join(","),
+                "applying SOCKS5 proxy override from environment"
+            );
+        }
 
         let mut state = AppState::with_components(
             Arc::new(RwLock::new(HashMap::new())),
@@ -1169,6 +1189,7 @@ mod tests {
                 request_timeout: None,
                 tls_insecure_skip_verify: false,
                 socks5: None,
+                socks5_overridden: false,
                 hls: None,
                 retry: RetryPolicy::default(),
                 header_policy: HeaderPolicy::default(),
