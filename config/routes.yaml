@@ -34,6 +34,8 @@ routes:
                                   # this address for every route at runtime.
         username: null           # Optional username for authenticated proxies.
         password: null           # Optional password for authenticated proxies.
+      redirect:
+        follow_max: 7           # Maximum redirects to follow per request (capped at 10).
     hls:
       enabled: true              # Enable HLS-specific response handling (playlist rewriting, segment normalization, etc.).
       rewrite_playlist_urls: true # Rewrites variant and segment URLs to the configured base_url.

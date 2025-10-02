@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use globset::{Glob, GlobMatcher};
 use http::header::HeaderName;
 use once_cell::sync::OnceCell;
-use reqwest::{redirect::Policy as RedirectPolicy, Client, Method, Proxy};
+use reqwest::{redirect::Policy as ReqwestRedirectPolicy, Client, Method, Proxy};
 use tokio::sync::RwLock;
 use tower::retry::budget::Budget;
 use url::Url;
@@ -76,6 +76,37 @@ pub struct RouteTarget {
     pub retry: RetryPolicy,
     /// Header forwarding policy applied when proxying requests and responses.
     pub header_policy: HeaderPolicy,
+    /// Redirect following policy for this route.
+    pub redirect: RedirectPolicy,
+}
+
+pub const DEFAULT_REDIRECT_FOLLOW_MAX: usize = 7;
+pub const HARD_REDIRECT_FOLLOW_MAX: usize = 10;
+
+#[derive(Debug, Clone)]
+pub struct RedirectPolicy {
+    follow_max: usize,
+}
+
+impl RedirectPolicy {
+    pub fn new(follow_max: usize) -> Self {
+        let clamped = follow_max.max(1).min(HARD_REDIRECT_FOLLOW_MAX);
+        Self {
+            follow_max: clamped,
+        }
+    }
+
+    pub fn follow_max(&self) -> usize {
+        self.follow_max
+    }
+}
+
+impl Default for RedirectPolicy {
+    fn default() -> Self {
+        Self {
+            follow_max: DEFAULT_REDIRECT_FOLLOW_MAX,
+        }
+    }
 }
 
 /// Strategy applied when constructing the `X-Forwarded-For` header.
@@ -614,6 +645,12 @@ impl From<crate::config::HeaderPolicyConfig> for HeaderPolicy {
     }
 }
 
+impl From<crate::config::RedirectConfig> for RedirectPolicy {
+    fn from(value: crate::config::RedirectConfig) -> Self {
+        RedirectPolicy::new(value.follow_max)
+    }
+}
+
 #[cfg(feature = "config-loader")]
 impl From<crate::config::XForwardedForConfig> for XForwardedFor {
     fn from(value: crate::config::XForwardedForConfig) -> Self {
@@ -805,7 +842,7 @@ impl DirectStreamState {
 }
 
 fn build_direct_stream_client(settings: &DirectStreamSettings) -> Result<Client, reqwest::Error> {
-    let mut builder = Client::builder().redirect(RedirectPolicy::none());
+    let mut builder = Client::builder().redirect(ReqwestRedirectPolicy::none());
 
     let resolver = Arc::new(crate::stream::direct::RestrictedDnsResolver::new());
 
@@ -968,6 +1005,7 @@ impl AppState {
                 hls,
                 retry: route.upstream.retry.clone().into(),
                 header_policy: route.upstream.header_policy.clone().into(),
+                redirect: route.upstream.redirect.clone().into(),
             };
 
             routing_table.insert(route.id.clone(), target);
@@ -1193,6 +1231,7 @@ mod tests {
                 hls: None,
                 retry: RetryPolicy::default(),
                 header_policy: HeaderPolicy::default(),
+                redirect: RedirectPolicy::default(),
             },
         );
 
