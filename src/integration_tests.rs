@@ -23,7 +23,7 @@ use url::Url;
 
 use sProx::config::{
     Config, DirectStreamAllowRule, DirectStreamAllowlist, DirectStreamConfig, DirectStreamScheme,
-    HeaderPolicyConfig, ListenerConfig, RetryConfig, RouteConfig, SecretsConfig,
+    HeaderPolicyConfig, ListenerConfig, RedirectConfig, RetryConfig, RouteConfig, SecretsConfig,
     SensitiveLoggingConfig, Socks5Config, TlsConfig, UpstreamConfig, XForwardedForConfig,
 };
 use sProx::state::{AppState, DirectStreamSettings, SharedAppState};
@@ -163,6 +163,7 @@ async fn spawn_route_proxy_context(
                 },
                 retry: RetryConfig::default(),
                 header_policy,
+                redirect: RedirectConfig::default(),
             },
             hls: None,
         }],
@@ -249,6 +250,7 @@ async fn health_endpoint_returns_success() {
                 },
                 retry: RetryConfig::default(),
                 header_policy: HeaderPolicyConfig::default(),
+                redirect: RedirectConfig::default(),
             },
             hls: None,
         }],
@@ -378,6 +380,7 @@ fn socks5_override_test_config() -> Config {
                 },
                 retry: RetryConfig::default(),
                 header_policy: HeaderPolicyConfig::default(),
+                redirect: RedirectConfig::default(),
             },
             hls: None,
         };

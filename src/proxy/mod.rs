@@ -1,4 +1,6 @@
 pub mod classify;
+pub mod headers;
+pub mod redirect;
 
 use std::io;
 use std::net::SocketAddr;
@@ -24,6 +26,7 @@ use thiserror::Error;
 use tracing::{error, info};
 use url::Url;
 
+use self::redirect::FollowRedirectError;
 use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget, SharedAppState};
@@ -70,6 +73,28 @@ pub enum ProxyError {
     UpstreamRequest {
         #[source]
         source: reqwest::Error,
+    },
+
+    #[error("redirect chain exceeded {limit} hops")]
+    RedirectLimitExceeded { limit: usize },
+
+    #[error("redirect response missing location header")]
+    RedirectMissingLocation,
+
+    #[error("redirect target `{location}` is invalid: {source}")]
+    RedirectInvalidLocation {
+        location: String,
+        #[source]
+        source: url::ParseError,
+    },
+
+    #[error("redirect target contains invalid characters")]
+    RedirectInvalidLocationEncoding,
+
+    #[error("failed to build referer header: {source}")]
+    RefererHeader {
+        #[source]
+        source: reqwest::header::InvalidHeaderValue,
     },
 
     #[error("retry budget exhausted for upstream request: {source}")]
@@ -175,7 +200,6 @@ pub async fn forward(
     );
     let upstream_url = build_upstream_url(&route, request.uri())?;
     span.record("upstream.url", &tracing::field::display(&upstream_url));
-    let manifest_url = upstream_url.clone();
     let upstream_scheme = upstream_url.scheme().to_string();
     let client_scheme =
         determine_client_scheme(&request).unwrap_or_else(|| upstream_scheme.clone());
@@ -200,57 +224,124 @@ pub async fn forward(
         }
     })?;
 
-    let mut builder = client.request(method, upstream_url.clone());
-    builder = builder.headers(headers);
-
     let request_timeout = route
         .request_timeout
         .or(route.read_timeout)
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
-    builder = builder.timeout(request_timeout);
-
-    let body_stream = request
-        .into_body()
-        .into_data_stream()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
-        .into_stream();
-    builder = builder.body(ReqwestBody::wrap_stream(body_stream));
-
-    let request = builder
-        .build()
-        .map_err(|source| ProxyError::UpstreamRequest { source })?;
-
+    let follow_max = route.redirect.follow_max();
     let request_start = Instant::now();
-    let retry_policy = route.retry.clone();
-    let retry_outcome = retry::execute_with_retry(client.clone(), request, retry_policy).await;
-    let retries = retry_outcome.retries();
-    let upstream_response = match retry_outcome.into_result() {
-        Ok(response) => response,
-        Err(RetryError::BudgetExhausted { source }) => {
-            let latency_ms = request_start.elapsed().as_millis() as u64;
-            error!(
-                request.id = %request_id,
-                route.id = %route_id,
-                latency_ms,
-                retry.count = retries,
-                error = %source,
-                "retry budget exhausted while forwarding request"
-            );
-            return Err(ProxyError::CircuitOpen { source });
+
+    let follow_result = match method.clone() {
+        ReqwestMethod::GET => {
+            let follow_request = redirect::FollowRedirectRequest {
+                client: client.clone(),
+                method: ReqwestMethod::GET,
+                url: upstream_url.clone(),
+                headers,
+                retry_policy: route.retry.clone(),
+                request_timeout,
+                follow_max,
+            };
+
+            let _ = request.into_body();
+
+            match redirect::get_with_adaptive_referer(follow_request).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(map_follow_error(
+                        error,
+                        &request_id,
+                        &route_id,
+                        request_start,
+                    ));
+                }
+            }
         }
-        Err(RetryError::Request(source)) => {
-            let latency_ms = request_start.elapsed().as_millis() as u64;
-            error!(
-                request.id = %request_id,
-                route.id = %route_id,
-                latency_ms,
-                retry.count = retries,
-                error = %source,
-                "failed to forward request to upstream"
-            );
-            return Err(ProxyError::UpstreamRequest { source });
+        ReqwestMethod::HEAD => {
+            let follow_request = redirect::FollowRedirectRequest {
+                client: client.clone(),
+                method: ReqwestMethod::HEAD,
+                url: upstream_url.clone(),
+                headers,
+                retry_policy: route.retry.clone(),
+                request_timeout,
+                follow_max,
+            };
+
+            let _ = request.into_body();
+
+            match redirect::follow_redirects(follow_request).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return Err(map_follow_error(
+                        error,
+                        &request_id,
+                        &route_id,
+                        request_start,
+                    ));
+                }
+            }
+        }
+        _ => {
+            let mut builder = client.request(method.clone(), upstream_url.clone());
+            builder = builder.headers(headers);
+            builder = builder.timeout(request_timeout);
+
+            let body_stream = request
+                .into_body()
+                .into_data_stream()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
+                .into_stream();
+            builder = builder.body(ReqwestBody::wrap_stream(body_stream));
+
+            let outbound = builder
+                .build()
+                .map_err(|source| ProxyError::UpstreamRequest { source })?;
+
+            let retry_outcome =
+                retry::execute_with_retry(client.clone(), outbound, route.retry.clone()).await;
+            let attempts = retry_outcome.attempts();
+            let retries = retry_outcome.retries();
+
+            match retry_outcome.into_result() {
+                Ok(response) => redirect::FollowRedirectResult {
+                    response,
+                    final_url: upstream_url.clone(),
+                    attempts,
+                    redirects: 0,
+                    chain: vec![upstream_url.clone()],
+                },
+                Err(RetryError::BudgetExhausted { source }) => {
+                    let latency_ms = request_start.elapsed().as_millis() as u64;
+                    error!(
+                        request.id = %request_id,
+                        route.id = %route_id,
+                        latency_ms,
+                        retry.count = retries,
+                        error = %source,
+                        "retry budget exhausted while forwarding request"
+                    );
+                    return Err(ProxyError::CircuitOpen { source });
+                }
+                Err(RetryError::Request(source)) => {
+                    let latency_ms = request_start.elapsed().as_millis() as u64;
+                    error!(
+                        request.id = %request_id,
+                        route.id = %route_id,
+                        latency_ms,
+                        retry.count = retries,
+                        error = %source,
+                        "failed to forward request to upstream"
+                    );
+                    return Err(ProxyError::UpstreamRequest { source });
+                }
+            }
         }
     };
+
+    let upstream_response = follow_result.response;
+    let manifest_url = follow_result.final_url;
+    let retries = follow_result.attempts.saturating_sub(1);
 
     let latency = request_start.elapsed();
     let latency_ms = latency.as_millis() as u64;
@@ -381,6 +472,98 @@ pub async fn forward(
     }
 
     Ok(response)
+}
+
+fn map_follow_error(
+    error: FollowRedirectError,
+    request_id: &str,
+    route_id: &str,
+    request_start: Instant,
+) -> ProxyError {
+    match error {
+        FollowRedirectError::Retry { error, attempts } => {
+            let retries = attempts.saturating_sub(1);
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            match error {
+                RetryError::BudgetExhausted { source } => {
+                    error!(
+                        request.id = %request_id,
+                        route.id = %route_id,
+                        latency_ms,
+                        retry.count = retries,
+                        error = %source,
+                        "retry budget exhausted while following redirects"
+                    );
+                    ProxyError::CircuitOpen { source }
+                }
+                RetryError::Request(source) => {
+                    error!(
+                        request.id = %request_id,
+                        route.id = %route_id,
+                        latency_ms,
+                        retry.count = retries,
+                        error = %source,
+                        "failed to follow redirect chain"
+                    );
+                    ProxyError::UpstreamRequest { source }
+                }
+            }
+        }
+        FollowRedirectError::LimitExceeded { limit } => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                limit,
+                "redirect chain exceeded configured limit"
+            );
+            ProxyError::RedirectLimitExceeded { limit }
+        }
+        FollowRedirectError::MissingLocation => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                "redirect response missing location header"
+            );
+            ProxyError::RedirectMissingLocation
+        }
+        FollowRedirectError::InvalidLocation { location, source } => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                redirect.location = %location,
+                error = %source,
+                "redirect target URL was invalid"
+            );
+            ProxyError::RedirectInvalidLocation { location, source }
+        }
+        FollowRedirectError::InvalidLocationEncoding => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                "redirect location header was not valid UTF-8"
+            );
+            ProxyError::RedirectInvalidLocationEncoding
+        }
+        FollowRedirectError::RefererBuild { source } => {
+            let latency_ms = request_start.elapsed().as_millis() as u64;
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                error = %source,
+                "failed to build referer header for redirect retry"
+            );
+            ProxyError::RefererHeader { source }
+        }
+    }
 }
 
 fn extract_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
@@ -846,7 +1029,7 @@ fn is_hop_by_hop_response_header(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::routing::{PortRange, RouteDefinition, RouteProtocol, RouteRequest, RoutingEngine};
-    use crate::state::{RetryPolicy, SecretsStore};
+    use crate::state::{RedirectPolicy, RetryPolicy, SecretsStore};
     use axum::http::header::HeaderValue;
     use axum::http::{HeaderMap, Request, Uri};
     use reqwest::header::HeaderName as ReqHeaderName;
@@ -1038,6 +1221,7 @@ mod tests {
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
+            redirect: RedirectPolicy::default(),
         };
         let uri: Uri = "/playlist.m3u8".parse().unwrap();
         let url = build_upstream_url(&target, &uri).unwrap();
@@ -1166,6 +1350,7 @@ mod tests {
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
+            redirect: RedirectPolicy::default(),
         };
 
         let builder = apply_client_timeouts(Client::builder(), &route);
@@ -1293,6 +1478,7 @@ mod tests {
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
+            redirect: RedirectPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1339,6 +1525,7 @@ mod tests {
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
+            redirect: RedirectPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1384,6 +1571,7 @@ mod tests {
             hls: None,
             retry: RetryPolicy::default(),
             header_policy: crate::state::HeaderPolicy::default(),
+            redirect: RedirectPolicy::default(),
         };
 
         let definition = RouteDefinition {
@@ -1600,6 +1788,7 @@ mod tests {
                 hls: Some(hls_options),
                 retry: RetryPolicy::default(),
                 header_policy: crate::state::HeaderPolicy::default(),
+                redirect: RedirectPolicy::default(),
             };
 
             let definition = RouteDefinition {

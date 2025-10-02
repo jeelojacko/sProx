@@ -11,6 +11,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::routing::RouteProtocol;
+use crate::state::{DEFAULT_REDIRECT_FOLLOW_MAX, HARD_REDIRECT_FOLLOW_MAX};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -167,6 +168,7 @@ pub struct UpstreamConfig {
     pub socks5: Socks5Config,
     pub retry: RetryConfig,
     pub header_policy: HeaderPolicyConfig,
+    pub redirect: RedirectConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +205,19 @@ pub struct RetryConfig {
     pub max_attempts: NonZeroU32,
     pub backoff: RetryBackoffConfig,
     pub budget: RetryBudgetConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RedirectConfig {
+    pub follow_max: usize,
+}
+
+impl Default for RedirectConfig {
+    fn default() -> Self {
+        Self {
+            follow_max: crate::state::DEFAULT_REDIRECT_FOLLOW_MAX,
+        }
+    }
 }
 
 impl Default for RetryConfig {
@@ -448,6 +463,8 @@ struct RawUpstream {
     retry: Option<RawRetry>,
     #[serde(default)]
     headers: RawHeaderPolicy,
+    #[serde(default)]
+    redirect: Option<RawRedirect>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -504,6 +521,12 @@ struct RawRetry {
     backoff: Option<RawRetryBackoff>,
     #[serde(default)]
     budget: Option<RawRetryBudget>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RawRedirect {
+    #[serde(default)]
+    follow_max: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1154,6 +1177,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
     let socks5 = parse_socks5(raw.socks5, context)?;
     let retry = parse_retry(raw.retry, format!("{context}.upstream.retry"))?;
     let header_policy = parse_header_policy(raw.headers, format!("{context}.upstream.headers"))?;
+    let redirect = parse_redirect(raw.redirect, format!("{context}.upstream.redirect"))?;
 
     Ok(UpstreamConfig {
         origin,
@@ -1164,6 +1188,7 @@ fn parse_upstream(raw: RawUpstream, context: &str) -> Result<UpstreamConfig, Con
         socks5,
         retry,
         header_policy,
+        redirect,
     })
 }
 
@@ -1338,6 +1363,22 @@ fn parse_header_policy(
     })
 }
 
+fn parse_redirect(
+    raw: Option<RawRedirect>,
+    context: String,
+) -> Result<RedirectConfig, ConfigError> {
+    let follow_max = match raw.and_then(|cfg| cfg.follow_max) {
+        Some(0) => return Err(validation_error(context, "follow_max must be at least 1")),
+        Some(value) => {
+            let clamped = value.min(HARD_REDIRECT_FOLLOW_MAX as u32);
+            usize::try_from(clamped).unwrap_or(DEFAULT_REDIRECT_FOLLOW_MAX)
+        }
+        None => DEFAULT_REDIRECT_FOLLOW_MAX,
+    };
+
+    Ok(RedirectConfig { follow_max })
+}
+
 fn parse_header_names(
     values: Vec<String>,
     context: String,
@@ -1453,6 +1494,7 @@ mod tests {
                 socks5: RawSocks5::default(),
                 retry: None,
                 headers: RawHeaderPolicy::default(),
+                redirect: None,
             },
             hls: None,
         }
@@ -1532,6 +1574,7 @@ mod tests {
                     socks5: RawSocks5::default(),
                     retry: None,
                     headers: RawHeaderPolicy::default(),
+                    redirect: None,
                 },
                 hls: None,
             }],
