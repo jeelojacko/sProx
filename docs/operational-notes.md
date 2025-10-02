@@ -12,6 +12,10 @@ observability, compliance, and release management tooling.
 - **Secrets management** – Store TLS private keys, DRM credentials, and API tokens in a
   secret manager (e.g., AWS Secrets Manager, HashiCorp Vault). Inject them at runtime via
   environment variables rather than committing them to configuration files.
+- **Direct stream controls** – Keep the `/proxy/stream` allowlist as narrow as possible.
+  Require `api_password` for production deployments and rotate the secret frequently. The
+  service automatically rejects destinations that resolve to private or documentation IP
+  ranges, but explicit network ACLs provide additional protection.
 - **Input validation** – Harden manifest parsers against malformed inputs. Reject paths
   containing directory traversal sequences and normalise headers to avoid request
   smuggling issues.
@@ -25,6 +29,9 @@ observability, compliance, and release management tooling.
   served from the same cluster.
 - Monitor certificate expiry and automate renewal. Integrate with ACME or corporate PKI
   using background jobs that place renewed keys in a hot-reloadable location.
+- Enable `watch_for_changes` on listeners so renewed certificates are reloaded without
+  restarts. When ACME cache directories are configured sProx prepares them automatically for
+  external clients.
 - Enforce strict transport security (HSTS) in client responses and consider enabling TLS
   session resumption to reduce handshake overhead.
 
@@ -42,7 +49,8 @@ observability, compliance, and release management tooling.
 - Emit structured logs (JSON) with request IDs, upstream latency, and manifest processing
   metrics. Forward them to a central aggregation system (ELK, Loki, etc.).
 - Publish Prometheus metrics for request volume, response codes, TLS handshakes, manifest
-  rewrite timings, and DRM key lookup latency.
+  rewrite timings, direct stream throughput, and DRM key lookup latency via the `/metrics`
+  endpoint.
 - Trace end-to-end requests with OpenTelemetry (OTLP exporter). Include spans for
   manifest parsing and upstream fetches to identify bottlenecks.
 
@@ -56,6 +64,12 @@ observability, compliance, and release management tooling.
   processing latency. For bursty events, consider pre-scaling nodes.
 - Maintain a runbook for incident response, including steps to rotate credentials, roll
   back configurations, and drain traffic.
+- Run `sprox validate -c <dir>` during CI/CD to catch configuration errors before rollout.
+- Use `kill -HUP` to reload configuration in place; failures fall back to the previous
+  snapshot. When TLS `watch_for_changes` is enabled certificate rotations require no manual
+  intervention.
+- Document required environment overrides (`SPROX_CONFIG`, `SPROX_PROXY_URL`,
+  `SPROX_DIRECT_*`) so operators know which secrets must be present in each environment.
 
 ## Disaster recovery
 
@@ -73,3 +87,5 @@ observability, compliance, and release management tooling.
 - Use feature flags for experimental manifest rewrites so they can be toggled without a
   redeploy.
 - Keep configuration schemas synchronised across environments to avoid runtime surprises.
+- Exercise the rate limiter, CORS policies, and direct stream allowlist in staging. Tests
+  should confirm that disallowed headers and destinations return `400`/`403` responses.
