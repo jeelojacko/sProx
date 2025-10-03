@@ -90,7 +90,7 @@ pub struct RedirectPolicy {
 
 impl RedirectPolicy {
     pub fn new(follow_max: usize) -> Self {
-        let clamped = follow_max.max(1).min(HARD_REDIRECT_FOLLOW_MAX);
+        let clamped = follow_max.clamp(1, HARD_REDIRECT_FOLLOW_MAX);
         Self {
             follow_max: clamped,
         }

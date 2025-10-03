@@ -181,8 +181,8 @@ pub async fn forward(
     let request_id = util::extract_request_id(request.headers());
     let host = extract_host(request.uri(), request.headers()).ok_or(ProxyError::MissingHost)?;
     let span = tracing::Span::current();
-    span.record("request.id", &tracing::field::display(&request_id));
-    span.record("route.host", &tracing::field::display(&host));
+    span.record("request.id", tracing::field::display(&request_id));
+    span.record("route.host", tracing::field::display(&host));
 
     let protocol = determine_route_protocol(&request);
     let port = extract_port(request.uri(), request.headers(), protocol);
@@ -193,17 +193,17 @@ pub async fn forward(
     };
 
     let (route_id, route) = lookup_route(state, &host, &route_request).await?;
-    span.record("route.id", &tracing::field::display(&route_id));
+    span.record("route.id", tracing::field::display(&route_id));
     span.record(
         "route.socks5_override",
-        &tracing::field::display(route.socks5_overridden),
+        tracing::field::display(route.socks5_overridden),
     );
     let upstream_url = build_upstream_url(&route, request.uri())?;
-    span.record("upstream.url", &tracing::field::display(&upstream_url));
+    span.record("upstream.url", tracing::field::display(&upstream_url));
     let upstream_scheme = upstream_url.scheme().to_string();
     let client_scheme =
         determine_client_scheme(&request).unwrap_or_else(|| upstream_scheme.clone());
-    span.record("client.scheme", &tracing::field::display(&client_scheme));
+    span.record("client.scheme", tracing::field::display(&client_scheme));
 
     let client = build_client(&route)?;
     let remote_addr = request

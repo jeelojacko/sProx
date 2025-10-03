@@ -262,7 +262,7 @@ pub async fn follow_redirects(
     let mut redirects = 0usize;
     let mut total_attempts = 0u32;
     let mut chain = Vec::new();
-    let limit = request.follow_max.max(1).min(HARD_REDIRECT_FOLLOW_MAX);
+    let limit = request.follow_max.clamp(1, HARD_REDIRECT_FOLLOW_MAX);
     let mut cookie_store = SimpleCookieStore::default();
 
     loop {
@@ -301,7 +301,26 @@ pub async fn follow_redirects(
 
         cookie_store.ingest(&response, &current_url);
 
-        if !response.status().is_redirection() {
+        let status = response.status();
+
+        if !status.is_redirection() {
+            return Ok(FollowRedirectResult {
+                response,
+                final_url: current_url,
+                attempts: total_attempts,
+                redirects,
+                chain,
+            });
+        }
+
+        if !matches!(
+            status,
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
             return Ok(FollowRedirectResult {
                 response,
                 final_url: current_url,

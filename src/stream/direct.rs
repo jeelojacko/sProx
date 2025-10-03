@@ -343,7 +343,7 @@ pub async fn handle_proxy_stream(
 ) -> Result<Response<Body>, (StatusCode, String)> {
     let request_id = util::extract_request_id(&downstream_headers);
     let span = tracing::Span::current();
-    span.record("request.id", &tracing::field::display(&request_id));
+    span.record("request.id", tracing::field::display(&request_id));
 
     if query.d.trim().is_empty() {
         return Err(DirectStreamError::MissingDestination.into_response());
@@ -368,7 +368,7 @@ pub async fn handle_proxy_stream(
 
     let upstream_url = Url::parse(&query.d)
         .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
-    span.record("upstream.url", &tracing::field::display(&upstream_url));
+    span.record("upstream.url", tracing::field::display(&upstream_url));
 
     let settings = state
         .with_current(|state| state.direct_stream_settings().cloned())
@@ -401,7 +401,7 @@ pub async fn handle_proxy_stream(
         response_bytes,
     } = stream_result;
 
-    span.record("upstream.url", &tracing::field::display(&final_url));
+    span.record("upstream.url", tracing::field::display(&final_url));
 
     let status = response.status();
     let response_bytes = response_bytes.unwrap_or_default();
