@@ -1,6 +1,7 @@
 pub mod classify;
 pub mod headers;
 pub mod redirect;
+pub mod ssrf;
 
 use std::io;
 use std::net::SocketAddr;
@@ -26,7 +27,7 @@ use thiserror::Error;
 use tracing::{error, info};
 use url::Url;
 
-use self::redirect::FollowRedirectError;
+use self::{redirect::FollowRedirectError, ssrf::ResolveError as SsrfResolveError};
 use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget, SharedAppState};
@@ -73,6 +74,15 @@ pub enum ProxyError {
     UpstreamRequest {
         #[source]
         source: reqwest::Error,
+    },
+
+    #[error("upstream endpoint blocked: {reason}")]
+    UpstreamBlocked { reason: String },
+
+    #[error("failed to resolve upstream host: {source}")]
+    UpstreamResolve {
+        #[source]
+        source: SsrfResolveError,
     },
 
     #[error("redirect chain exceeded {limit} hops")]
@@ -283,6 +293,15 @@ pub async fn forward(
             }
         }
         _ => {
+            if let Err(error) = ssrf::resolve_and_check(&upstream_url).await {
+                return Err(map_resolve_error(
+                    error,
+                    &request_id,
+                    &route_id,
+                    request_start,
+                ));
+            }
+
             let mut builder = client.request(method.clone(), upstream_url.clone());
             builder = builder.headers(headers);
             builder = builder.timeout(request_timeout);
@@ -562,6 +581,56 @@ fn map_follow_error(
                 "failed to build referer header for redirect retry"
             );
             ProxyError::RefererHeader { source }
+        }
+        FollowRedirectError::Ssrf { error } => {
+            map_resolve_error(error, request_id, route_id, request_start)
+        }
+    }
+}
+
+fn map_resolve_error(
+    error: SsrfResolveError,
+    request_id: &str,
+    route_id: &str,
+    request_start: Instant,
+) -> ProxyError {
+    let latency_ms = request_start.elapsed().as_millis() as u64;
+
+    match error {
+        SsrfResolveError::BlockedIp { ip } => {
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                %ip,
+                "blocked upstream ip address",
+            );
+            ProxyError::UpstreamBlocked {
+                reason: format!("ip {ip}"),
+            }
+        }
+        SsrfResolveError::OnionHost { host } => {
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                host = %host,
+                "blocked onion service host",
+            );
+            ProxyError::UpstreamBlocked {
+                reason: format!("host {host}"),
+            }
+        }
+        other => {
+            let description = other.to_string();
+            error!(
+                request.id = %request_id,
+                route.id = %route_id,
+                latency_ms,
+                error = %description,
+                "failed to resolve upstream host",
+            );
+            ProxyError::UpstreamResolve { source: other }
         }
     }
 }
@@ -1466,6 +1535,7 @@ mod tests {
     async fn request_timeout_is_enforced_for_slow_upstream() {
         let delay = Duration::from_millis(250);
         let (addr, shutdown) = spawn_delayed_http_server(delay).await;
+        let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
 
         let route = RouteTarget {
             upstream: format!("http://{}", addr),
@@ -1513,6 +1583,7 @@ mod tests {
     async fn read_timeout_is_used_when_request_timeout_missing() {
         let delay = Duration::from_millis(250);
         let (addr, shutdown) = spawn_delayed_http_server(delay).await;
+        let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
 
         let route = RouteTarget {
             upstream: format!("http://{}", addr),
@@ -1559,6 +1630,7 @@ mod tests {
     #[tokio::test]
     async fn forward_records_tracing_metadata() {
         let (addr, shutdown) = spawn_delayed_http_server(Duration::from_millis(0)).await;
+        let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
 
         let route = RouteTarget {
             upstream: format!("http://{}", addr),
@@ -1769,6 +1841,7 @@ mod tests {
                 "application/vnd.apple.mpegurl",
             )
             .await;
+            let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
 
             let hls_options = HlsOptions {
                 enabled: true,

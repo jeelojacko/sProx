@@ -10,7 +10,7 @@ use reqwest::{
 };
 use url::Url;
 
-use crate::proxy::headers;
+use crate::proxy::{headers, ssrf};
 use crate::retry::{self, RetryError};
 use crate::state::{RetryPolicy, HARD_REDIRECT_FOLLOW_MAX};
 
@@ -252,6 +252,9 @@ pub enum FollowRedirectError {
     RefererBuild {
         source: reqwest::header::InvalidHeaderValue,
     },
+    Ssrf {
+        error: ssrf::ResolveError,
+    },
 }
 
 pub async fn follow_redirects(
@@ -267,6 +270,10 @@ pub async fn follow_redirects(
 
     loop {
         chain.push(current_url.clone());
+
+        ssrf::resolve_and_check(&current_url)
+            .await
+            .map_err(|error| FollowRedirectError::Ssrf { error })?;
 
         cookie_store.apply(&mut headers, &current_url);
 
@@ -552,6 +559,7 @@ mod tests {
     #[tokio::test]
     async fn follow_redirects_preserves_cookie_jar() {
         let (addr, shutdown, cookies) = spawn_redirect_chain().await;
+        let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
 
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -584,6 +592,7 @@ mod tests {
 
     #[tokio::test]
     async fn adaptive_referer_recovers_from_forbidden() {
+        let _loopback = crate::proxy::ssrf::allow_loopback_for_tests();
         use axum::extract::State;
         use axum::http::{HeaderMap, StatusCode};
         use axum::response::Response as AxumResponse;
