@@ -5,8 +5,12 @@ use std::sync::{
     Mutex, MutexGuard,
 };
 
+use hyper::client::connect::dns::Name;
 use once_cell::sync::Lazy;
 
+use reqwest::dns::{
+    Addrs as ReqwestAddrs, Resolve as ReqwestResolve, Resolving as ReqwestResolving,
+};
 use thiserror::Error;
 use tokio::net::lookup_host;
 use url::Url;
@@ -158,8 +162,19 @@ pub async fn resolve_and_check(url: &Url) -> Result<SocketAddr, ResolveError> {
             scheme: url.scheme().to_string(),
         })?;
 
+    resolve_host_checked(&host, port).await.and_then(|addrs| {
+        addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| ResolveError::NoAddresses { host })
+    })
+}
+
+async fn resolve_host_checked(host: &str, port: u16) -> Result<Vec<SocketAddr>, ResolveError> {
     if host.ends_with(".onion") {
-        return Err(ResolveError::OnionHost { host });
+        return Err(ResolveError::OnionHost {
+            host: host.to_string(),
+        });
     }
 
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -167,36 +182,62 @@ pub async fn resolve_and_check(url: &Url) -> Result<SocketAddr, ResolveError> {
             return Err(ResolveError::BlockedIp { ip });
         }
 
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let mut addrs =
-        lookup_host((host.as_str(), port))
-            .await
-            .map_err(|source| ResolveError::Lookup {
-                host: host.clone(),
-                source,
-            })?;
+    let mut addrs = lookup_host((host, port))
+        .await
+        .map_err(|source| ResolveError::Lookup {
+            host: host.to_string(),
+            source,
+        })?;
 
-    let mut allowed = None;
+    let mut allowed = Vec::new();
     for addr in addrs.by_ref() {
         if !is_ip_allowed(&addr.ip()) {
             return Err(ResolveError::BlockedIp { ip: addr.ip() });
         }
 
-        if allowed.is_none() {
-            allowed = Some(addr);
-        }
+        allowed.push(SocketAddr::new(addr.ip(), port));
     }
 
     drop(addrs);
 
-    allowed.ok_or_else(|| ResolveError::NoAddresses { host })
+    if allowed.is_empty() {
+        return Err(ResolveError::NoAddresses {
+            host: host.to_string(),
+        });
+    }
+
+    Ok(allowed)
+}
+
+#[derive(Debug, Default)]
+pub struct GuardedDnsResolver;
+
+impl ReqwestResolve for GuardedDnsResolver {
+    fn resolve(&self, name: Name) -> ReqwestResolving {
+        let host = name.as_str().to_ascii_lowercase();
+        Box::pin(async move {
+            match resolve_host_checked(&host, 0).await {
+                Ok(addrs) => {
+                    let iter: ReqwestAddrs = Box::new(addrs.into_iter());
+                    Ok(iter)
+                }
+                Err(error) => {
+                    let err: Box<dyn std::error::Error + Send + Sync> = Box::new(error);
+                    Err::<ReqwestAddrs, _>(err)
+                }
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::str::FromStr;
 
     fn ipv4(addr: [u8; 4]) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]))
@@ -290,5 +331,29 @@ mod tests {
             error,
             ResolveError::OnionHost { host } if host == "example.onion"
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_blocks_loopback_addresses() {
+        let _lock = lock_loopback_for_tests();
+        let resolver = GuardedDnsResolver::default();
+        let name = Name::from_str("127.0.0.1").unwrap();
+        let error = resolver
+            .resolve(name)
+            .await
+            .err()
+            .expect("loopback resolution should fail");
+        let error = error.downcast::<ResolveError>().unwrap();
+        assert!(matches!(*error, ResolveError::BlockedIp { ip } if ip.is_loopback()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_allows_public_ip_literal() {
+        let resolver = GuardedDnsResolver::default();
+        let name = Name::from_str("8.8.8.8").unwrap();
+        let mut addrs = resolver.resolve(name).await.unwrap();
+        let addr = addrs.next().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(addr.port(), 0);
     }
 }

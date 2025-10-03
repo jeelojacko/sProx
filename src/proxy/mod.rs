@@ -5,6 +5,7 @@ pub mod ssrf;
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -841,6 +842,7 @@ fn build_client(route: &RouteTarget) -> Result<Client, ProxyError> {
     let mut builder = Client::builder()
         .redirect(Policy::none())
         .danger_accept_invalid_certs(route.tls_insecure_skip_verify);
+    builder = builder.dns_resolver(Arc::new(ssrf::GuardedDnsResolver));
     builder = apply_client_timeouts(builder, route);
 
     if let Some(proxy) = &route.socks5 {
