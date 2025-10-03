@@ -13,7 +13,7 @@ use axum::{
     Router,
 };
 use futures::stream;
-use reqwest::StatusCode;
+use reqwest::{header as reqwest_header, StatusCode};
 use tokio::{
     net::TcpListener,
     sync::{oneshot, Mutex},
@@ -735,6 +735,121 @@ async fn proxy_stream_returns_full_body_and_injects_accept_ranges() {
         .collect::<Vec<_>>();
     assert!(requests.contains(&Method::HEAD));
     assert!(requests.contains(&Method::GET));
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_supports_open_ended_range_requests() {
+    let body = vec![0x5au8; 1_200_000];
+    let context = spawn_stream_test(body.clone()).await;
+    let upstream_log = context.upstream_log();
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .header(reqwest_header::RANGE, "bytes=0-")
+        .send()
+        .await
+        .expect("range request should succeed");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let headers = response.headers();
+    let expected_content_range = format!("bytes 0-{}/{}", body.len() - 1, body.len());
+    assert_eq!(
+        headers
+            .get(reqwest_header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_content_range.as_str())
+    );
+    assert_eq!(
+        headers
+            .get(reqwest_header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(body.len())
+    );
+    assert_eq!(
+        headers
+            .get(reqwest_header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes.len(), body.len());
+    assert_eq!(bytes, body);
+
+    let log = upstream_log.lock().await;
+    for method in [Method::HEAD, Method::GET] {
+        let entry = log
+            .iter()
+            .find(|record| record.method == method)
+            .expect("request should be recorded");
+        let range_header = entry
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(range_header, Some("bytes=0-"));
+    }
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_stream_supports_large_offset_range_requests() {
+    let body = vec![0xabu8; 1_500_000];
+    let offset = 1_000_000usize;
+    let context = spawn_stream_test(body.clone()).await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .header(reqwest_header::RANGE, "bytes=1000000-")
+        .send()
+        .await
+        .expect("range request should succeed");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let headers = response.headers();
+    let expected_content_range = format!("bytes {}-{}/{}", offset, body.len() - 1, body.len());
+    assert_eq!(
+        headers
+            .get(reqwest_header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_content_range.as_str())
+    );
+    let expected_length = body.len() - offset;
+    assert_eq!(
+        headers
+            .get(reqwest_header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(expected_length)
+    );
+    assert_eq!(
+        headers
+            .get(reqwest_header::ACCEPT_RANGES)
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes")
+    );
+
+    let bytes = response.bytes().await.expect("body should stream");
+    assert_eq!(bytes.len(), expected_length);
+    assert_eq!(bytes.as_ref(), &body[offset..]);
 
     context.shutdown().await;
 }
@@ -1492,8 +1607,10 @@ async fn upstream_handler(
 
     let effective_range = if allow_partial { requested_range } else { None };
 
-    let (status, slice, length, range_metadata) = if let Some((start, end)) = effective_range {
-        let end = end.min(full.len().saturating_sub(1));
+    let (status, slice, length, range_metadata) = if let Some((start, maybe_end)) = effective_range
+    {
+        let max_index = full.len().saturating_sub(1);
+        let end = maybe_end.unwrap_or(max_index).min(max_index);
         let start = start.min(end);
         let length = end - start + 1;
         (
@@ -1546,14 +1663,20 @@ async fn upstream_handler(
     }
 }
 
-fn parse_range_header(value: &str) -> Option<(usize, usize)> {
+fn parse_range_header(value: &str) -> Option<(usize, Option<usize>)> {
     let value = value.strip_prefix("bytes=")?;
     let mut parts = value.splitn(2, '-');
     let start = parts.next()?.parse().ok()?;
-    let end = parts.next()?.parse().ok()?;
-    if start <= end {
-        Some((start, end))
+    let end = parts.next()?;
+
+    if end.is_empty() {
+        Some((start, None))
     } else {
-        None
+        let end = end.parse().ok()?;
+        if start <= end {
+            Some((start, Some(end)))
+        } else {
+            None
+        }
     }
 }

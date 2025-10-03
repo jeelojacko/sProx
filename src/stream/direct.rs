@@ -17,7 +17,8 @@ use axum::{
         StatusCode, Uri,
     },
 };
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, TryStream, TryStreamExt};
+use hyper::body::Bytes;
 use hyper::{
     client::connect::dns::{GaiResolver as HyperGaiResolver, Name},
     service::Service,
@@ -30,7 +31,6 @@ use reqwest::{
         HeaderMap as ReqwestHeaderMap, HeaderName as ReqwestHeaderName,
         HeaderValue as ReqwestHeaderValue, InvalidHeaderName as ReqwestInvalidHeaderName,
         InvalidHeaderValue as ReqwestInvalidHeaderValue, CONTENT_LENGTH, CONTENT_RANGE, LOCATION,
-        TRANSFER_ENCODING,
     },
     Client, Method, Url,
 };
@@ -50,18 +50,15 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
     "content-type",
     "content-length",
     "content-range",
-    "content-disposition",
-    "content-encoding",
-    "transfer-encoding",
-    "cache-control",
+    "accept-ranges",
     "etag",
     "last-modified",
+    "cache-control",
     "expires",
-    "date",
-    "vary",
     "pragma",
-    "accept-ranges",
 ];
+
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 const MAX_REDIRECTS: usize = 10;
 
@@ -560,19 +557,11 @@ impl DirectStreamService {
 
         let mut response_headers = HeaderMap::new();
         let mut has_accept_ranges = false;
-        let mut transfer_encoding_values: Vec<HeaderValue> = Vec::new();
         let mut content_length_value: Option<HeaderValue> = None;
         let mut content_range_value: Option<HeaderValue> = None;
 
         for (name, value) in get_outcome.response.headers().iter() {
             if !is_response_header_allowed(name.as_str()) {
-                continue;
-            }
-
-            if name == TRANSFER_ENCODING {
-                let header_value = HeaderValue::from_bytes(value.as_bytes())
-                    .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?;
-                transfer_encoding_values.push(header_value);
                 continue;
             }
 
@@ -623,21 +612,14 @@ impl DirectStreamService {
         let known_length = get_outcome.response.content_length();
         let response_bytes = known_length;
 
-        match known_length {
-            Some(length) => {
-                let header_value = if let Some(value) = content_length_value {
-                    value
-                } else {
-                    HeaderValue::from_str(&length.to_string())
-                        .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?
-                };
-                response_headers.insert(header::CONTENT_LENGTH, header_value);
-            }
-            None => {
-                for value in transfer_encoding_values {
-                    response_headers.append(header::TRANSFER_ENCODING, value);
-                }
-            }
+        if let Some(length) = known_length {
+            let header_value = if let Some(value) = content_length_value {
+                value
+            } else {
+                HeaderValue::from_str(&length.to_string())
+                    .map_err(|source| DirectStreamError::InvalidInboundHeaderValue { source })?
+            };
+            response_headers.insert(header::CONTENT_LENGTH, header_value);
         }
 
         if !has_accept_ranges {
@@ -648,8 +630,9 @@ impl DirectStreamService {
             .response
             .bytes_stream()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error));
+        let chunked_stream = ChunkedBody::new(stream);
 
-        let body = Body::from_stream(stream);
+        let body = Body::from_stream(chunked_stream);
 
         let mut response = Response::builder().status(status).body(body)?;
         *response.headers_mut() = response_headers;
@@ -794,6 +777,84 @@ impl DirectStreamService {
             .map_err(|source| DirectStreamError::InvalidRedirectLocation { location, source })?;
 
         Ok(Some(next))
+    }
+}
+
+struct ChunkedBody<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    finished: bool,
+}
+
+impl<S> ChunkedBody<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn flush_chunk(&mut self, limit: usize) -> Option<Bytes> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+
+        let chunk = if self.buffer.len() > limit {
+            let remainder = self.buffer.split_off(limit);
+            std::mem::replace(&mut self.buffer, remainder)
+        } else {
+            std::mem::take(&mut self.buffer)
+        };
+
+        Some(Bytes::from(chunk))
+    }
+}
+
+impl<S> futures::Stream for ChunkedBody<S>
+where
+    S: TryStream<Ok = Bytes, Error = io::Error> + Unpin,
+{
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        loop {
+            if let Some(chunk) = self.flush_chunk(STREAM_CHUNK_SIZE) {
+                return std::task::Poll::Ready(Some(Ok(chunk)));
+            }
+
+            if self.finished {
+                return if let Some(chunk) = self.flush_chunk(STREAM_CHUNK_SIZE) {
+                    std::task::Poll::Ready(Some(Ok(chunk)))
+                } else {
+                    std::task::Poll::Ready(None)
+                };
+            }
+
+            match std::pin::Pin::new(&mut self.inner).try_poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    if !bytes.is_empty() {
+                        self.buffer.extend_from_slice(&bytes);
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(error))) => {
+                    return std::task::Poll::Ready(Some(Err(error)))
+                }
+                std::task::Poll::Ready(None) => {
+                    self.finished = true;
+                }
+                std::task::Poll::Pending => {
+                    return if let Some(chunk) = self.flush_chunk(STREAM_CHUNK_SIZE) {
+                        std::task::Poll::Ready(Some(Ok(chunk)))
+                    } else {
+                        std::task::Poll::Pending
+                    };
+                }
+            }
+        }
     }
 }
 
