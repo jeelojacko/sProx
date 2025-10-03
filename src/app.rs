@@ -452,6 +452,7 @@ fn map_proxy_error(error: ProxyError) -> axum::http::Response<Body> {
     let status = match error {
         ProxyError::MissingHost => StatusCode::BAD_REQUEST,
         ProxyError::RouteNotFound { .. } => StatusCode::NOT_FOUND,
+        ProxyError::UpstreamBlocked { .. } => StatusCode::FORBIDDEN,
         _ => StatusCode::BAD_GATEWAY,
     };
 

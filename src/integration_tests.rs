@@ -305,6 +305,7 @@ async fn prometheus_metrics_report_proxy_counters() {
         ("etag".to_string(), "test".to_string()),
     ];
     let context = spawn_route_proxy_context(HeaderPolicyConfig::default(), response_headers).await;
+    let _loopback = sProx::proxy::ssrf::allow_loopback_for_tests();
 
     let client = reqwest::Client::new();
     let response = client
@@ -542,6 +543,7 @@ async fn proxy_strips_hop_by_hop_headers_and_normalizes_forwarders() {
         ("X-Upstream-Header".to_string(), "preserved".to_string()),
     ];
     let context = spawn_route_proxy_context(HeaderPolicyConfig::default(), response_headers).await;
+    let _loopback = sProx::proxy::ssrf::allow_loopback_for_tests();
     let client = reqwest::Client::new();
     let response = client
         .get(format!("http://{}/asset", context.proxy_addr()))
@@ -616,6 +618,7 @@ async fn proxy_replaces_x_forwarded_for_when_configured() {
         ..HeaderPolicyConfig::default()
     };
     let context = spawn_route_proxy_context(policy, Vec::new()).await;
+    let _loopback = sProx::proxy::ssrf::allow_loopback_for_tests();
 
     let client = reqwest::Client::new();
     let response = client
@@ -656,6 +659,7 @@ async fn proxy_forwards_authorization_when_allowed() {
         .allow
         .push(header::HeaderName::from_static("authorization"));
     let context = spawn_route_proxy_context(policy, Vec::new()).await;
+    let _loopback = sProx::proxy::ssrf::allow_loopback_for_tests();
 
     let client = reqwest::Client::new();
     let response = client
