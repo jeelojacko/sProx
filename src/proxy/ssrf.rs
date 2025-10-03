@@ -5,6 +5,7 @@ use std::sync::{
     Mutex, MutexGuard,
 };
 
+use http::uri::Authority;
 use hyper::client::connect::dns::Name;
 use once_cell::sync::Lazy;
 
@@ -217,9 +218,18 @@ pub struct GuardedDnsResolver;
 
 impl ReqwestResolve for GuardedDnsResolver {
     fn resolve(&self, name: Name) -> ReqwestResolving {
-        let host = name.as_str().to_ascii_lowercase();
+        let name_str = name.as_str();
+        let (host, port) = name_str
+            .parse::<Authority>()
+            .map(|authority| {
+                (
+                    authority.host().to_ascii_lowercase(),
+                    authority.port_u16().unwrap_or(0),
+                )
+            })
+            .unwrap_or_else(|_| (name_str.to_ascii_lowercase(), 0));
         Box::pin(async move {
-            match resolve_host_checked(&host, 0).await {
+            match resolve_host_checked(&host, port).await {
                 Ok(addrs) => {
                     let iter: ReqwestAddrs = Box::new(addrs.into_iter());
                     Ok(iter)
@@ -355,5 +365,15 @@ mod tests {
         let addr = addrs.next().unwrap();
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         assert_eq!(addr.port(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolver_preserves_port_from_name() {
+        let resolver = GuardedDnsResolver::default();
+        let name = Name::from_str("8.8.8.8:443").unwrap();
+        let mut addrs = resolver.resolve(name).await.unwrap();
+        let addr = addrs.next().unwrap();
+        assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(addr.port(), 443);
     }
 }
