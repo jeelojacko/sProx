@@ -430,10 +430,10 @@ pub async fn forward(
         let mut updated = false;
         for (name, value) in header_entries.iter_mut() {
             if name == &CONTENT_TYPE {
-                let should_update = value
-                    .to_str()
-                    .map(|existing| !existing.eq_ignore_ascii_case(guessed_type))
-                    .unwrap_or(true);
+                let should_update = match value.to_str() {
+                    Ok(existing) => existing.trim().is_empty(),
+                    Err(_) => true,
+                };
                 if should_update {
                     *value = HeaderValue::from_static(guessed_type);
                 }
