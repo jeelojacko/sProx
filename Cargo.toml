@@ -12,6 +12,7 @@ default = [
 ]
 
 # Enable core HTTP proxy stack built on Axum/Tower.
+serde = ["dep:serde"]
 http-proxy = [
     "dep:axum",
     "dep:tower",

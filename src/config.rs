@@ -1615,6 +1615,13 @@ mod tests {
 
     #[test]
     fn direct_stream_parses_configured_values() {
+        let _guard = env_lock().lock().expect("env lock should be acquired");
+
+        env::remove_var("SPROX_DIRECT_PROXY_URL");
+        env::remove_var("SPROX_DIRECT_API_PASSWORD");
+        env::remove_var("SPROX_DIRECT_REQUEST_TIMEOUT_MS");
+        env::remove_var("SPROX_DIRECT_RESPONSE_BUFFER_BYTES");
+
         let raw = RawConfig {
             direct_stream: Some(RawDirectStream {
                 proxy_url: Some("http://proxy.local:8080".into()),
