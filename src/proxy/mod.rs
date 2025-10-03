@@ -1,5 +1,6 @@
 pub mod classify;
 pub mod headers;
+pub mod mime;
 pub mod redirect;
 pub mod ssrf;
 
@@ -12,7 +13,9 @@ use axum::body::Body;
 use axum::extract::{connect_info::ConnectInfo, OriginalUri};
 use axum::http::{
     self,
-    header::{HeaderName, HeaderValue, CONTENT_LENGTH, FORWARDED, HOST},
+    header::{
+        HeaderName, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, FORWARDED, HOST,
+    },
     HeaderMap, Request, Response, Uri,
 };
 use futures::TryStreamExt;
@@ -28,7 +31,11 @@ use thiserror::Error;
 use tracing::{error, info};
 use url::Url;
 
-use self::{redirect::FollowRedirectError, ssrf::ResolveError as SsrfResolveError};
+use self::{
+    mime::{guess_content_type, sanitize_filename},
+    redirect::FollowRedirectError,
+    ssrf::ResolveError as SsrfResolveError,
+};
 use crate::retry::{self, RetryError};
 use crate::routing::{RouteProtocol, RouteRequest};
 use crate::state::{AppState, RouteTarget, SharedAppState};
@@ -417,6 +424,54 @@ pub async fn forward(
             HeaderValue::from_str(&via_value)
                 .map_err(|source| ProxyError::InvalidInboundHeaderValue { source })?,
         ));
+    }
+
+    if let Some(guessed_type) = guess_content_type(&manifest_url) {
+        let mut updated = false;
+        for (name, value) in header_entries.iter_mut() {
+            if name == &CONTENT_TYPE {
+                let should_update = value
+                    .to_str()
+                    .map(|existing| !existing.eq_ignore_ascii_case(guessed_type))
+                    .unwrap_or(true);
+                if should_update {
+                    *value = HeaderValue::from_static(guessed_type);
+                }
+                updated = true;
+                break;
+            }
+        }
+
+        if !updated {
+            header_entries.push((
+                HeaderName::from_static("content-type"),
+                HeaderValue::from_static(guessed_type),
+            ));
+        }
+    }
+
+    if let Some(filename) = manifest_url.query_pairs().find_map(|(name, value)| {
+        if name == "filename" {
+            sanitize_filename(value.as_ref())
+        } else {
+            None
+        }
+    }) {
+        let header_value_string = format!("inline; filename=\"{}\"", filename);
+        if let Ok(header_value) = HeaderValue::from_str(&header_value_string) {
+            let mut updated = false;
+            for (name, value) in header_entries.iter_mut() {
+                if name == &CONTENT_DISPOSITION {
+                    *value = header_value.clone();
+                    updated = true;
+                    break;
+                }
+            }
+
+            if !updated {
+                header_entries.push((HeaderName::from_static("content-disposition"), header_value));
+            }
+        }
     }
 
     let should_process_hls = route
