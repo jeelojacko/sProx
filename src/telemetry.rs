@@ -71,6 +71,26 @@ fn init_metrics() -> Result<()> {
         "sprox_health_checks_total",
         "Total number of successful /health responses served."
     );
+    metrics::describe_counter!(
+        "sprox_proxy_stream_requests_total",
+        "Total number of /proxy/stream responses emitted grouped by HTTP status."
+    );
+    metrics::describe_counter!(
+        "sprox_proxy_stream_upstream_status_total",
+        "Total number of upstream responses observed by /proxy/stream grouped by status."
+    );
+    metrics::describe_counter!(
+        "sprox_proxy_stream_bytes_out_total",
+        "Total bytes streamed to clients via /proxy/stream grouped by status."
+    );
+    metrics::describe_histogram!(
+        "sprox_proxy_stream_first_byte_latency_seconds",
+        "Latency histogram (in seconds) for time-to-first-byte observed by /proxy/stream."
+    );
+    metrics::describe_histogram!(
+        "sprox_proxy_stream_duration_seconds",
+        "Latency histogram (in seconds) for full request duration of /proxy/stream."
+    );
 
     Ok(())
 }

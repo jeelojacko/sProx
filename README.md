@@ -433,6 +433,8 @@ The proxy reads sensitive runtime configuration from environment variables. Copy
 * `SPROX_DIRECT_PROXY_URL` – Override the HTTP proxy used by `/proxy/stream` requests.
 * `SPROX_DIRECT_API_PASSWORD` – Inject the shared secret required for `/proxy/stream`
   without modifying configuration files.
+* `SPROX_API_PASSWORD` – Require `Authorization: Bearer` tokens for `/proxy/stream`
+  requests and other protected routes.
 * `SPROX_DIRECT_REQUEST_TIMEOUT_MS` – Override the direct stream request timeout in
   milliseconds.
 * `SPROX_DIRECT_RESPONSE_BUFFER_BYTES` – Override the initial HTTP/2 receive window for

@@ -16,7 +16,7 @@ use futures::stream;
 use reqwest::{header as reqwest_header, StatusCode};
 use tokio::{
     net::TcpListener,
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Notify},
     task::JoinHandle,
 };
 use url::Url;
@@ -27,6 +27,7 @@ use sProx::config::{
     SensitiveLoggingConfig, Socks5Config, TlsConfig, UpstreamConfig, XForwardedForConfig,
 };
 use sProx::state::{AppState, DirectStreamSettings, SharedAppState};
+use sProx::stream::direct;
 
 #[cfg(feature = "telemetry")]
 fn ensure_telemetry_initialized() {
@@ -740,6 +741,81 @@ async fn proxy_stream_returns_full_body_and_injects_accept_ranges() {
 }
 
 #[tokio::test]
+async fn proxy_stream_returns_401_without_authorization_token() {
+    let body = b"auth-required".to_vec();
+    let context = spawn_stream_test_with_config_and_state_builder(
+        body,
+        |addr| DirectStreamConfig {
+            allowlist: DirectStreamAllowlist {
+                rules: vec![DirectStreamAllowRule {
+                    domain: addr.ip().to_string(),
+                    schemes: vec![DirectStreamScheme::Http],
+                    path_globs: vec!["/**".into()],
+                }],
+            },
+            ..DirectStreamConfig::default()
+        },
+        |state| state.with_api_password(Some("shared-secret".into())),
+    )
+    .await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_stream_returns_403_for_invalid_authorization_token() {
+    let body = b"auth-invalid".to_vec();
+    let context = spawn_stream_test_with_config_and_state_builder(
+        body,
+        |addr| DirectStreamConfig {
+            allowlist: DirectStreamAllowlist {
+                rules: vec![DirectStreamAllowRule {
+                    domain: addr.ip().to_string(),
+                    schemes: vec![DirectStreamScheme::Http],
+                    path_globs: vec!["/**".into()],
+                }],
+            },
+            ..DirectStreamConfig::default()
+        },
+        |state| state.with_api_password(Some("shared-secret".into())),
+    )
+    .await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(proxy_url)
+        .header(reqwest_header::AUTHORIZATION, "Bearer wrong-secret")
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    context.shutdown().await;
+}
+
+#[tokio::test]
 async fn direct_stream_supports_open_ended_range_requests() {
     let body = vec![0x5au8; 1_200_000];
     let context = spawn_stream_test(body.clone()).await;
@@ -854,6 +930,89 @@ async fn direct_stream_supports_large_offset_range_requests() {
     context.shutdown().await;
 }
 
+#[tokio::test]
+async fn proxy_stream_enforces_concurrency_limit() {
+    let body = vec![0x42u8; 16 * 1024];
+    let context = spawn_stream_test(body).await;
+
+    let blocker = Arc::new(Notify::new());
+    let upstream_state = context.upstream_state();
+    upstream_state
+        .set_stream_blocker(Some(blocker.clone()))
+        .await;
+
+    let mut proxy_url = Url::parse(&format!("http://{}/proxy/stream", context.app_addr()))
+        .expect("proxy url should parse");
+    proxy_url
+        .query_pairs_mut()
+        .append_pair("d", &format!("http://{}/asset", context.upstream_addr()));
+
+    let client = reqwest::Client::new();
+
+    let concurrency_limit = direct::direct_stream_concurrency_limit_for_tests();
+    let mut stream_handles = Vec::with_capacity(concurrency_limit);
+    for _ in 0..concurrency_limit {
+        let url = proxy_url.clone();
+        let client = client.clone();
+        stream_handles.push(tokio::spawn(async move {
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .expect("stream request should start");
+            let status = response.status();
+            let _ = response
+                .bytes()
+                .await
+                .expect("streaming response should complete once unblocked");
+            status
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let overflow = client
+        .get(proxy_url.clone())
+        .send()
+        .await
+        .expect("concurrency probe should complete");
+    assert_eq!(overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    drop(overflow);
+
+    blocker.notify_waiters();
+    upstream_state.set_stream_blocker(None).await;
+
+    let mut success = 0usize;
+    let mut rejected = 0usize;
+    for handle in stream_handles {
+        match handle
+            .await
+            .expect("stream task should complete without panicking")
+        {
+            StatusCode::OK => success += 1,
+            StatusCode::TOO_MANY_REQUESTS => rejected += 1,
+            other => panic!("unexpected status from stream task: {other}"),
+        }
+    }
+
+    assert!(
+        success > 0,
+        "expected at least one stream to acquire a permit"
+    );
+    assert_eq!(success + rejected, concurrency_limit);
+
+    let recovery = client
+        .get(proxy_url.clone())
+        .send()
+        .await
+        .expect("recovery request should complete");
+    assert_eq!(recovery.status(), StatusCode::OK);
+    let _ = recovery.bytes().await.expect("recovery body should stream");
+
+    context.shutdown().await;
+}
+
 #[cfg(feature = "telemetry")]
 #[tokio::test]
 async fn prometheus_metrics_report_direct_stream_counters() {
@@ -890,6 +1049,28 @@ async fn prometheus_metrics_report_direct_stream_counters() {
         .expect("request counter should be present");
     assert!(requests >= 1.0, "request counter should increment");
 
+    let proxy_requests = metric_value(
+        &metrics,
+        "sprox_proxy_stream_requests_total",
+        "route=\"direct_stream\",status=\"200\"",
+    )
+    .expect("proxy stream requests counter should be present");
+    assert!(
+        proxy_requests >= 1.0,
+        "proxy stream requests should increment"
+    );
+
+    let upstream_status = metric_value(
+        &metrics,
+        "sprox_proxy_stream_upstream_status_total",
+        "route=\"direct_stream\",status=\"200\"",
+    )
+    .expect("upstream status counter should be present");
+    assert!(
+        upstream_status >= 1.0,
+        "upstream status counter should increment"
+    );
+
     let latency_count = metric_value(
         &metrics,
         "sprox_upstream_latency_seconds_count",
@@ -907,6 +1088,39 @@ async fn prometheus_metrics_report_direct_stream_counters() {
     assert!(
         bytes >= body.len() as f64,
         "byte counter should track streamed size"
+    );
+
+    let proxy_bytes = metric_value(
+        &metrics,
+        "sprox_proxy_stream_bytes_out_total",
+        "route=\"direct_stream\",status=\"200\"",
+    )
+    .expect("proxy stream byte counter should be present");
+    assert!(
+        proxy_bytes >= body.len() as f64,
+        "proxy stream byte counter should track streamed size"
+    );
+
+    let first_byte_count = metric_value(
+        &metrics,
+        "sprox_proxy_stream_first_byte_latency_seconds_count",
+        "route=\"direct_stream\",status=\"200\"",
+    )
+    .expect("first byte histogram count should be present");
+    assert!(
+        first_byte_count >= 1.0,
+        "first byte latency should record samples"
+    );
+
+    let duration_count = metric_value(
+        &metrics,
+        "sprox_proxy_stream_duration_seconds_count",
+        "route=\"direct_stream\",status=\"200\"",
+    )
+    .expect("duration histogram count should be present");
+    assert!(
+        duration_count >= 1.0,
+        "duration histogram should record samples"
     );
 
     context.shutdown().await;
@@ -1402,6 +1616,18 @@ async fn spawn_stream_test_with_config_builder<F>(
 where
     F: Fn(SocketAddr) -> DirectStreamConfig,
 {
+    spawn_stream_test_with_config_and_state_builder(body, config_builder, |state| state).await
+}
+
+async fn spawn_stream_test_with_config_and_state_builder<F, S>(
+    body: Vec<u8>,
+    config_builder: F,
+    state_builder: S,
+) -> StreamTestContext
+where
+    F: Fn(SocketAddr) -> DirectStreamConfig,
+    S: Fn(AppState) -> AppState,
+{
     let upstream_state = UpstreamState::new(body);
     let upstream_log = upstream_state.log.clone();
     let upstream_router = Router::new()
@@ -1426,7 +1652,7 @@ where
     let direct_stream = config_builder(upstream_addr);
     let settings: DirectStreamSettings = direct_stream.into();
 
-    let app_state = AppState::new().with_direct_stream_settings(settings);
+    let app_state = state_builder(AppState::new().with_direct_stream_settings(settings));
     let router = app::build_router(SharedAppState::new(app_state));
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1506,6 +1732,10 @@ impl UpstreamState {
     async fn set_chunk_size(&self, chunk_size: usize) {
         self.config.lock().await.chunk_size = chunk_size.max(1);
     }
+
+    async fn set_stream_blocker(&self, blocker: Option<Arc<Notify>>) {
+        self.config.lock().await.stream_blocker = blocker;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1521,6 +1751,7 @@ struct TestUpstreamConfig {
     etag: String,
     last_modified: String,
     fail_get_attempts: usize,
+    stream_blocker: Option<Arc<Notify>>,
 }
 
 impl Default for TestUpstreamConfig {
@@ -1531,6 +1762,7 @@ impl Default for TestUpstreamConfig {
             etag: "test-etag".to_string(),
             last_modified: "Tue, 20 Feb 2024 10:00:00 GMT".to_string(),
             fail_get_attempts: 0,
+            stream_blocker: None,
         }
     }
 }
@@ -1646,6 +1878,15 @@ async fn upstream_handler(
         builder
             .body(AxumBody::empty())
             .expect("head response should build")
+    } else if let Some(blocker) = config.stream_blocker.clone() {
+        let stream_body = slice;
+        let stream = stream::once(async move {
+            blocker.notified().await;
+            Ok::<AxumBytes, axum::Error>(AxumBytes::from(stream_body))
+        });
+        builder
+            .body(AxumBody::from_stream(stream))
+            .expect("blocked stream response should build")
     } else if config.chunked {
         let chunk_size = config.chunk_size;
         let chunks = slice

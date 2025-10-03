@@ -2,6 +2,9 @@ use std::{
     collections::HashMap,
     fmt, io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
     time::Instant,
 };
 
@@ -11,7 +14,7 @@ use axum::{
     http::{
         header::{
             self, InvalidHeaderName as HttpInvalidHeaderName,
-            InvalidHeaderValue as HttpInvalidHeaderValue,
+            InvalidHeaderValue as HttpInvalidHeaderValue, AUTHORIZATION,
         },
         Error as HttpError, HeaderMap, HeaderName as HttpHeaderName, HeaderValue, Response,
         StatusCode, Uri,
@@ -41,6 +44,7 @@ use url::form_urlencoded;
 use crate::retry;
 use crate::state::{DirectStreamSettings, SharedAppState};
 use crate::util;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, info};
 
 const DIRECT_STREAM_PASSWORD_HEADER: &str = "x-sprox-api-password";
@@ -61,6 +65,20 @@ const RESPONSE_HEADER_ALLOWLIST: &[&str] = &[
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 const MAX_REDIRECTS: usize = 10;
+
+#[cfg(test)]
+const DIRECT_STREAM_CONCURRENCY_LIMIT: usize = 2;
+#[cfg(not(test))]
+const DIRECT_STREAM_CONCURRENCY_LIMIT: usize = 50;
+
+static DIRECT_STREAM_CONCURRENCY_SEMAPHORE: Lazy<Arc<Semaphore>> =
+    Lazy::new(|| Arc::new(Semaphore::new(DIRECT_STREAM_CONCURRENCY_LIMIT)));
+
+#[allow(dead_code)]
+#[doc(hidden)]
+pub fn direct_stream_concurrency_limit_for_tests() -> usize {
+    DIRECT_STREAM_CONCURRENCY_LIMIT
+}
 
 static RESTRICTED_NETWORKS: Lazy<Vec<IpNet>> = Lazy::new(|| {
     vec![
@@ -111,6 +129,9 @@ enum DirectStreamError {
 
     #[error("direct stream password is invalid")]
     InvalidApiPassword,
+
+    #[error("direct stream concurrency limit exceeded")]
+    ConcurrencyLimitExceeded,
 
     #[error("invalid destination url: {source}")]
     InvalidDestination {
@@ -274,6 +295,10 @@ impl DirectStreamError {
                 StatusCode::FORBIDDEN,
                 "direct stream password is invalid".to_string(),
             ),
+            Self::ConcurrencyLimitExceeded => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "direct stream concurrency limit exceeded".to_string(),
+            ),
             Self::ClientBuild { source } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to initialize direct stream client: {source}"),
@@ -342,56 +367,125 @@ pub async fn handle_proxy_stream(
     let span = tracing::Span::current();
     span.record("request.id", tracing::field::display(&request_id));
 
+    let request_start = Instant::now();
+    let mut concurrency_guard: Option<OwnedSemaphorePermit> = None;
+    let abort_with_error = |guard: &mut Option<OwnedSemaphorePermit>, error: DirectStreamError| {
+        if let Some(permit) = guard.take() {
+            drop(permit);
+        }
+        let (status, message) = error.into_response();
+        record_stream_error_metrics(status, request_start);
+        Err((status, message))
+    };
+
     if query.d.trim().is_empty() {
-        return Err(DirectStreamError::MissingDestination.into_response());
+        return abort_with_error(
+            &mut concurrency_guard,
+            DirectStreamError::MissingDestination,
+        );
     }
 
-    if let Some(expected_password) = state.with_current(|state| {
-        state
-            .direct_stream_api_password()
-            .map(|value| value.to_owned())
-    }) {
+    let (global_password, direct_password) = state.with_current(|state| {
+        (
+            state.api_password().map(|value| value.to_owned()),
+            state
+                .direct_stream_api_password()
+                .map(|value| value.to_owned()),
+        )
+    });
+
+    if let Some(expected_password) = global_password {
+        let provided_password = extract_bearer_token(&downstream_headers);
+        match provided_password {
+            Some(value) if value == expected_password => {}
+            Some(_) => {
+                return abort_with_error(
+                    &mut concurrency_guard,
+                    DirectStreamError::InvalidApiPassword,
+                );
+            }
+            None => {
+                return abort_with_error(
+                    &mut concurrency_guard,
+                    DirectStreamError::MissingApiPassword,
+                );
+            }
+        }
+    } else if let Some(expected_password) = direct_password {
         let provided_password = extract_api_password(&downstream_headers, &query);
         match provided_password {
             Some(value) if value == expected_password => {}
             Some(_) => {
-                return Err(DirectStreamError::InvalidApiPassword.into_response());
+                return abort_with_error(
+                    &mut concurrency_guard,
+                    DirectStreamError::InvalidApiPassword,
+                );
             }
             None => {
-                return Err(DirectStreamError::MissingApiPassword.into_response());
+                return abort_with_error(
+                    &mut concurrency_guard,
+                    DirectStreamError::MissingApiPassword,
+                );
             }
         }
     }
 
-    let upstream_url = Url::parse(&query.d)
-        .map_err(|source| DirectStreamError::InvalidDestination { source }.into_response())?;
+    let upstream_url = match Url::parse(&query.d) {
+        Ok(url) => url,
+        Err(source) => {
+            return abort_with_error(
+                &mut concurrency_guard,
+                DirectStreamError::InvalidDestination { source },
+            );
+        }
+    };
     span.record("upstream.url", tracing::field::display(&upstream_url));
+
+    concurrency_guard = match Arc::clone(&DIRECT_STREAM_CONCURRENCY_SEMAPHORE).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            return abort_with_error(
+                &mut concurrency_guard,
+                DirectStreamError::ConcurrencyLimitExceeded,
+            )
+        }
+    };
 
     let settings = state
         .with_current(|state| state.direct_stream_settings().cloned())
         .unwrap_or_default();
 
     let overrides = extract_header_overrides(&uri);
-    let upstream_headers = prepare_upstream_headers(&downstream_headers, &overrides, &settings)
-        .map_err(|error| error.into_response())?;
+    let upstream_headers =
+        match prepare_upstream_headers(&downstream_headers, &overrides, &settings) {
+            Ok(headers) => headers,
+            Err(error) => return abort_with_error(&mut concurrency_guard, error),
+        };
 
-    let client = state
-        .with_current(|state| state.direct_stream_client())
-        .map_err(|source| DirectStreamError::ClientBuild { source }.into_response())?;
+    let client = match state.with_current(|state| state.direct_stream_client()) {
+        Ok(client) => client,
+        Err(source) => {
+            return abort_with_error(
+                &mut concurrency_guard,
+                DirectStreamError::ClientBuild { source },
+            )
+        }
+    };
     let service = DirectStreamService::new(client, settings);
 
-    let start = Instant::now();
     let stream_result = match service.stream(upstream_url, upstream_headers).await {
         Ok(result) => result,
         Err(error) => {
             error!(request.id = %request_id, error = %error, "direct stream request failed");
-            return Err(error.into_response());
+            return abort_with_error(&mut concurrency_guard, error);
         }
     };
-    let latency = start.elapsed();
+    let latency = request_start.elapsed();
 
     let StreamResult {
-        response,
+        status,
+        headers,
+        body,
         final_url,
         head_attempts,
         get_attempts,
@@ -400,7 +494,6 @@ pub async fn handle_proxy_stream(
 
     span.record("upstream.url", tracing::field::display(&final_url));
 
-    let status = response.status();
     let response_bytes = response_bytes.unwrap_or_default();
     let head_retries = head_attempts.saturating_sub(1);
     let get_retries = get_attempts.saturating_sub(1);
@@ -416,7 +509,7 @@ pub async fn handle_proxy_stream(
         retry.count.get = get_retries,
         retry.count.total = total_retries,
         response.bytes = response_bytes,
-        "completed direct stream"
+        "completed direct stream",
     );
 
     #[cfg(feature = "telemetry")]
@@ -434,14 +527,45 @@ pub async fn handle_proxy_stream(
         .increment(response_bytes);
     }
 
+    let permit = concurrency_guard
+        .take()
+        .expect("concurrency permit should be held");
+    let instrumented_body = InstrumentedStream::new(body, permit, request_start, status);
+    let body = Body::from_stream(instrumented_body);
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+
     Ok(response)
 }
 
 fn extract_api_password(headers: &HeaderMap, query: &DirectStreamQuery) -> Option<String> {
-    headers
-        .get(DIRECT_STREAM_PASSWORD_HEADER)
-        .and_then(|value| value.to_str().ok().map(|value| value.to_owned()))
+    extract_bearer_token(headers)
+        .or_else(|| {
+            headers
+                .get(DIRECT_STREAM_PASSWORD_HEADER)
+                .and_then(|value| value.to_str().ok().map(|value| value.to_owned()))
+        })
         .or_else(|| query.extra.get(DIRECT_STREAM_PASSWORD_QUERY_KEY).cloned())
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| {
+            let (scheme, token) = raw.split_once(' ')?;
+            if scheme.eq_ignore_ascii_case("bearer") {
+                let trimmed = token.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            } else {
+                None
+            }
+        })
 }
 
 fn extract_header_overrides(uri: &Uri) -> Vec<(String, String)> {
@@ -631,14 +755,12 @@ impl DirectStreamService {
             .bytes_stream()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error));
         let chunked_stream = ChunkedBody::new(stream);
-
-        let body = Body::from_stream(chunked_stream);
-
-        let mut response = Response::builder().status(status).body(body)?;
-        *response.headers_mut() = response_headers;
+        let body: BoxedByteStream = Box::pin(chunked_stream);
 
         Ok(StreamResult {
-            response,
+            status,
+            headers: response_headers,
+            body,
             final_url: get_outcome.final_url,
             head_attempts,
             get_attempts,
@@ -864,13 +986,147 @@ struct RequestOutcome {
     attempts: u32,
 }
 
+type BoxedByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>>;
+
 struct StreamResult {
-    response: Response<Body>,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: BoxedByteStream,
     final_url: Url,
     head_attempts: u32,
     get_attempts: u32,
     response_bytes: Option<u64>,
 }
+
+struct InstrumentedStream {
+    inner: BoxedByteStream,
+    permit: Option<OwnedSemaphorePermit>,
+    start: Instant,
+    status: StatusCode,
+    bytes_streamed: u64,
+    first_byte_latency: Option<f64>,
+    finished: bool,
+}
+
+impl InstrumentedStream {
+    fn new(
+        inner: BoxedByteStream,
+        permit: OwnedSemaphorePermit,
+        start: Instant,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            inner,
+            permit: Some(permit),
+            start,
+            status,
+            bytes_streamed: 0,
+            first_byte_latency: None,
+            finished: false,
+        }
+    }
+
+    fn observe_completion(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        #[cfg(feature = "telemetry")]
+        {
+            let status_label = self.status.as_u16().to_string();
+            metrics::counter!(
+                "sprox_proxy_stream_requests_total",
+                "route" => "direct_stream",
+                "status" => status_label.clone(),
+            )
+            .increment(1);
+            metrics::counter!(
+                "sprox_proxy_stream_upstream_status_total",
+                "route" => "direct_stream",
+                "status" => status_label.clone(),
+            )
+            .increment(1);
+            metrics::counter!(
+                "sprox_proxy_stream_bytes_out_total",
+                "route" => "direct_stream",
+                "status" => status_label.clone(),
+            )
+            .increment(self.bytes_streamed);
+            metrics::histogram!(
+                "sprox_proxy_stream_duration_seconds",
+                "route" => "direct_stream",
+                "status" => status_label.clone(),
+            )
+            .record(self.start.elapsed().as_secs_f64());
+            if let Some(first_byte) = self.first_byte_latency {
+                metrics::histogram!(
+                    "sprox_proxy_stream_first_byte_latency_seconds",
+                    "route" => "direct_stream",
+                    "status" => status_label,
+                )
+                .record(first_byte);
+            }
+        }
+
+        if let Some(permit) = self.permit.take() {
+            drop(permit);
+        }
+    }
+}
+
+impl futures::Stream for InstrumentedStream {
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let len = bytes.len() as u64;
+                if len > 0 && self.first_byte_latency.is_none() {
+                    self.first_byte_latency = Some(self.start.elapsed().as_secs_f64());
+                }
+                self.bytes_streamed = self.bytes_streamed.saturating_add(len);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.observe_completion();
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.observe_completion();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for InstrumentedStream {
+    fn drop(&mut self) {
+        self.observe_completion();
+    }
+}
+
+#[cfg(feature = "telemetry")]
+fn record_stream_error_metrics(status: StatusCode, start: Instant) {
+    let status_label = status.as_u16().to_string();
+
+    metrics::counter!(
+        "sprox_proxy_stream_requests_total",
+        "route" => "direct_stream",
+        "status" => status_label.clone(),
+    )
+    .increment(1);
+    metrics::histogram!(
+        "sprox_proxy_stream_duration_seconds",
+        "route" => "direct_stream",
+        "status" => status_label,
+    )
+    .record(start.elapsed().as_secs_f64());
+}
+
+#[cfg(not(feature = "telemetry"))]
+fn record_stream_error_metrics(_: StatusCode, _: Instant) {}
 
 fn validate_upstream_status(status: reqwest::StatusCode) -> Result<(), DirectStreamError> {
     if status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT {

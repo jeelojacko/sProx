@@ -883,6 +883,7 @@ pub struct AppState {
     direct_stream: Option<DirectStreamState>,
     sensitive_logging: SensitiveLoggingConfig,
     cors: Option<CorsConfig>,
+    api_password: Option<String>,
 }
 
 /// Shared handle that allows the application state to be swapped atomically at runtime.
@@ -950,6 +951,7 @@ impl AppState {
             direct_stream: None,
             sensitive_logging: SensitiveLoggingConfig::default(),
             cors: None,
+            api_password: None,
         }
     }
 
@@ -1045,6 +1047,12 @@ impl AppState {
             state = state.with_direct_stream_settings(direct_stream.into());
         }
 
+        let api_password = env::var("SPROX_API_PASSWORD")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        state = state.with_api_password(api_password);
+
         state = state.with_sensitive_logging(config.sensitive_logging.clone().into());
         state = state.with_cors(config.cors.clone());
 
@@ -1092,6 +1100,12 @@ impl AppState {
         self
     }
 
+    /// Applies an API password required for privileged endpoints.
+    pub fn with_api_password(mut self, password: Option<String>) -> Self {
+        self.api_password = password;
+        self
+    }
+
     /// Applies sensitive logging configuration.
     pub fn with_sensitive_logging(mut self, config: SensitiveLoggingConfig) -> Self {
         self.sensitive_logging = config;
@@ -1121,6 +1135,11 @@ impl AppState {
         self.direct_stream
             .as_ref()
             .and_then(|state| state.settings().api_password())
+    }
+
+    /// Returns the configured API password protecting administrative routes.
+    pub fn api_password(&self) -> Option<&str> {
+        self.api_password.as_deref()
     }
 
     /// Returns the configured direct stream settings when available.
@@ -1180,6 +1199,7 @@ impl Default for AppState {
             direct_stream: None,
             sensitive_logging: SensitiveLoggingConfig::default(),
             cors: None,
+            api_password: None,
         }
     }
 }
