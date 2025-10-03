@@ -540,13 +540,25 @@ pub async fn handle_proxy_stream(
 }
 
 fn extract_api_password(headers: &HeaderMap, query: &DirectStreamQuery) -> Option<String> {
-    extract_bearer_token(headers)
-        .or_else(|| {
-            headers
-                .get(DIRECT_STREAM_PASSWORD_HEADER)
-                .and_then(|value| value.to_str().ok().map(|value| value.to_owned()))
-        })
-        .or_else(|| query.extra.get(DIRECT_STREAM_PASSWORD_QUERY_KEY).cloned())
+    let header_password = headers
+        .get(DIRECT_STREAM_PASSWORD_HEADER)
+        .and_then(|value| value.to_str().ok().map(|value| value.to_owned()));
+    if header_password.is_some() {
+        return header_password;
+    }
+
+    let query_password = query.extra.get(DIRECT_STREAM_PASSWORD_QUERY_KEY).cloned();
+    if query_password.is_some() {
+        return query_password;
+    }
+
+    if headers.contains_key(DIRECT_STREAM_PASSWORD_HEADER)
+        || query.extra.contains_key(DIRECT_STREAM_PASSWORD_QUERY_KEY)
+    {
+        None
+    } else {
+        extract_bearer_token(headers)
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
