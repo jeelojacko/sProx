@@ -505,6 +505,8 @@ Supplementary documents live in the `docs/` directory:
   explanations of planned subsystems.
 - [`operational-notes.md`](docs/operational-notes.md) – security, TLS, and DRM checklists
   for running sProx in production.
+- [`debrid-only-guide.md`](docs/debrid-only-guide.md) – step-by-step setup for a minimal
+  Real-Debrid/AllDebrid streaming proxy deployment.
 
 These documents will evolve alongside feature development; contributions that keep the
 architecture and operational runbooks up to date are welcome.
